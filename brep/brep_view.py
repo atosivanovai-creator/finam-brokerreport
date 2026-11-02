@@ -10,12 +10,13 @@ from __future__ import annotations
 import datetime as dt
 import os
 from collections import defaultdict
+from urllib.parse import urlencode
 
 import dash_ag_grid as dag
 from dash import Dash, Input, Output, dcc, html, no_update
 
 from .brep_model import Store, ru
-from .brep_parse import day_after as bp_day_after
+from .brep_parse import FLOW_MAP, day_after as bp_day_after
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -157,7 +158,8 @@ SEC_COLS = [
           tip="оценка на конец − на начало + продажи − покупки + погашения + купоны/дивиденды + комиссии"),
     {"field": "chk", "headerName": "Кол‑во", "width": 58, "minWidth": 58, "tooltipField": "chk_tip",
      "cellStyle": {"textAlign": "center"}, "headerClass": "hc",
-     "cellClassRules": {"bad": "params.value && params.value !== '✓'", "ok": "params.value === '✓'"}},
+     # количество не сошлось — на торговлю не влияет ⇒ жёлтый (warn, --warnt), было — красный (bad)
+     "cellClassRules": {"warn": "params.value && params.value !== '✓'", "ok": "params.value === '✓'"}},
 ]
 
 
@@ -216,6 +218,102 @@ def days_rows(acc, a: str, b: str, mode: str):
     return out, [tot]
 
 
+def ins_total(rows):
+    """Строка «Итого» блока «По инструментам» — общая для экрана (_ins) и файла HTML (brep_export)."""
+    tot = {"instr": "Итого"}
+    for f in ("vm", "exch", "broker", "net", "lots", "deals"):
+        tot[f] = round(sum(r[f] for r in rows), 2)
+    return tot
+
+
+def sum_data(acc, a: str, b: str):
+    """Колонки сводки [(подпись, итоги)] и заметка о границах по справкам — для экрана (_sum) и файла HTML."""
+    ys = acc.years(a, b)
+    tot = acc.summary(a, b, "Итого")
+    notes = [f"{s['label']}: {s['note']}" for s in ys + ([tot] if tot else []) if s["note"]]
+    cols_data = [(s["label"], s) for s in ys] + ([("Итого", tot)] if tot and len(ys) != 1 else [])
+    note = ("Границы по справкам — " + "; ".join(notes) + ": стоимость счёта известна только на концах справок, "
+            "справка за период внутри себя по стоимости не делится.") if notes else ""
+    return cols_data, note
+
+
+def sec_visible(acc) -> bool:
+    """Блок «Ценные бумаги» показывается, только если бумаги на счёте были хоть раз за всю историю."""
+    return bool(acc is not None and acc.reports and (acc.p_names or acc.p_trades or acc.p_fx))
+
+
+def sec_notes(sec) -> list:
+    notes = [f"По справкам: {ru(bp_day_after(sec['from']))} – {ru(sec['to'])}. Позиция — «плановый остаток» брокера: "
+             "с купленным, но ещё не поставленным, и с бумагами, выданными брокеру в займ; сделки — по дате сделки."]
+    if sec["lend"]:
+        notes.append(f"Займ ЦБ брокеру: {sec['lend']} операций выдачи/возврата за всё время — в количестве и "
+                     "результате не участвуют (бумага на займе остаётся вашей).")
+    if sec["bad"]:
+        notes.append("⚠ Количество не сошлось: " + ", ".join(sec["bad"]) + " — результат по ним неточен.")
+    if sec["unknown"]:
+        notes.append("⚠ Не распознано строк справок: " + "; ".join(f"{k} — {v}" for k, v in sec["unknown"].items()))
+    return notes
+
+
+def empty_msg(acc, store, account: str) -> str:
+    """Почему отчёта нет (справок нет / не разобрались / ошибка сборки) — экран (_head) и файл HTML (ответ 503)."""
+    msg = store.error or f"справок счёта {account} пока нет"
+    bad = getattr(acc, "bad_files", None) if acc is not None else None
+    if bad:                                   # все справки не разобрались — сказать какие и почему
+        msg = "справки не разобраны: " + "; ".join(f"{n} — {w}" for n, w in bad)
+    return msg
+
+
+def head_info(acc, store_error: str = ""):
+    """Шапка, строка сверки и подвал отчёта: (meta, checks, foot); checks/foot — [(текст, класс | None)].
+    Общие для экрана (_head) и файла HTML (brep_export) — один текст и одни условия ✓/⚠."""
+    # справка с нераспознанными итогами брокера — «сверка невозможна», а не «✓» (0 = 0);
+    # нераспознанные строки справок — в шапке всегда (прежде — только в блоке бумаг, скрытом без бумаг)
+    na = getattr(acc, "recon_na", [])
+    mism = bool(acc.recon_bad or acc.go_bad)
+    bad = getattr(acc, "bad_files", [])       # битые файлы пропущены — «✓» за них не ставим
+    ok = not mism and not na and not bad
+    n_ok = len(acc.reports) - len({f for f, _ in acc.recon_bad} | {f for f, _ in na})
+    # на торговлю не влияет — жёлтый (красный — только «мешает торговать»); сверка
+    # «Отчёта брокера» на торговлю не влияет никогда ⇒ ⚠ шапки жёлтый и при «не сошлось» (S3I, было — красный)
+    checks = [("✓ " if ok else "⚠ ", "ok" if ok else "warn"),
+              (f"сверка с итогами брокера: {n_ok} из {len(acc.reports)} справок, {len(FLOW_MAP)} видов денег", None)]
+    if na:
+        checks.append((f" · сверка невозможна: {len(na)} — итоги брокера в справке не распознаны", "warn"))
+    if acc.unknown:
+        checks.append((" · не распознано строк: " + "; ".join(f"{k} — {v}" for k, v in acc.unknown.items()), "warn"))
+    if bad:                                   # битый файл пропущен — с пометкой (жёлтая)
+        checks.append((f" · файл не разобран: {len(bad)}", "warn"))
+    meta = f"справок {len(acc.reports)} · {ru(acc.first)} – {ru(acc.last)}"
+    foot = [("Деньги — оплаченные рублёвые строки справок; по каждой справке их сумма по видам сверена с "
+             "итогами брокера «Виды движений денежных средств». Прибыль = изменение стоимости счёта без "
+             "ввода и вывода между ближайшими точными точками (начало/конец справок).", None)] + \
+           [("Замечания: " + "; ".join(acc.notes), None)] * bool(acc.notes) + \
+           [("⚠ Не сошлось со справкой: " + str(acc.recon_bad + acc.go_bad), "warn")] * mism + \
+           [("⚠ Сверка невозможна (итоги «Виды движений» не распознаны — раскладка справки сменилась?): "
+             + ", ".join(f for f, _ in na), "warn")] * bool(na) + \
+           [("⚠ Справка не разобрана, в отчёте не учтена: " + "; ".join(f"{n} — {w}" for n, w in bad),
+             "warn")] * bool(bad) + \
+           [("⚠ " + store_error, "warn")] * bool(store_error)
+    return meta, checks, foot
+
+
+# пояснения в заголовках блоков — экран и файл HTML (brep_export)
+HINTS = {
+    "sum": "по календарным годам и за выбранный период; наведите на показатель — пояснение",
+    "ins": "срочный рынок; комиссия брокера за день делится по лотам дня",
+    "sec": "облигации, акции, фонды — по ISIN; позиция и оценка — на концах справок",
+    "days": "стоимость счёта точна в дни справок, между ними (курсив) — оценка",
+}
+EXPORT_PATH = "export.html"      # файл HTML отчёта: адрес под url_base окна (маршрут — brep_export.register)
+
+
+def export_href(a, b, mode, imode) -> str:
+    """Ссылка кнопки «HTML ↓»: относительно страницы окна (url_base) — с выбранным периодом и разбивками."""
+    q = {k: v for k, v in (("from", (a or "")[:10]), ("to", (b or "")[:10]), ("mode", mode), ("imode", imode)) if v}
+    return EXPORT_PATH + ("?" + urlencode(q) if q else "")
+
+
 def _block(title, note, *children):
     return html.Section([html.Div([html.H2(title), html.Span(note, className="hint")], className="bh"), *children],
                         className="card")
@@ -237,20 +335,32 @@ def mount(server, url_base: str, account: str, reports_dir: str, cache_dir: str,
     except Exception as e:                                      # noqa: BLE001 — отчёт не падает из-за графиков
         print(f"⚠ окно «Графики» не поднялось: {type(e).__name__}: {e}", flush=True)
         charts_link = []
+    try:                                                        # файл HTML отчёта за период
+        from . import brep_export
+        brep_export.register(server, url_base, account, store)
+    except Exception as e:                                      # noqa: BLE001 — отчёт не падает из-за выгрузки
+        print(f"⚠ выгрузка отчёта в HTML не поднялась: {type(e).__name__}: {e}", flush=True)
     links = html.Span(charts_link + [html.A(t,
                                             href=u, target="_blank", rel="noopener noreferrer", title=tip, className="lnk")
-                                     for t, u, tip in LINKS], className="links")
+                                     for t, u, tip in LINKS] +
+                     # CSV и «HTML ↓» — в общей строке шапки
+                     [html.Button("CSV", id="d-csv", className="btn hbtn",
+                                  title="Скачать таблицу «По дням» (выбранный период и разбивка) в CSV"),
+                      # весь отчёт за период (таблицы + графики) одним файлом — на диск
+                      html.A("HTML ↓", id="d-html", href=EXPORT_PATH, download="", className="btn hbtn",
+                             title="Скачать отчёт за выбранный период одним файлом HTML: все таблицы и графики, "
+                                   "открывается без сети и без программы, удобно печатать")], className="links")
     app.layout = html.Div([
         html.Header([html.H1(id="title"), links, html.Nav(stand_nav or []), html.Span(id="meta", className="meta")]),
         html.Div([dcc.RadioItems(id="preset", inline=True, className="seg"),
                   html.Span("с", className="meta"), dcc.Input(id="d-from", type="date", className="inp date"),
                   html.Span("по", className="meta"), dcc.Input(id="d-to", type="date", className="inp date"),
                   html.Span(id="checks", className="checks")], className="bar"),
-        _block("Сводка", "по календарным годам и за выбранный период; наведите на показатель — пояснение",
+        _block("Сводка", HINTS["sum"],
                dag.AgGrid(id="g-sum", defaultColDef={"sortable": False, "resizable": True, "suppressMovable": True},
                           dashGridOptions=dict(GRID, domLayout="autoHeight"), className="g", style={"height": "auto"}),
                html.Div(id="sum-notes", className="notes")),
-        _block("По инструментам", "срочный рынок; комиссия брокера за день делится по лотам дня",
+        _block("По инструментам", HINTS["ins"],
                html.Div([dcc.RadioItems(id="i-mode", options=[{"label": "базовый актив", "value": "base"},
                                                               {"label": "контракт", "value": "code"}],
                                         value="base", inline=True, className="seg")], className="tools"),
@@ -258,17 +368,16 @@ def mount(server, url_base: str, account: str, reports_dir: str, cache_dir: str,
                # columnSize="responsiveSizeToFit" (он же затирал ширины, заданные вручную)
                dag.AgGrid(id="g-i", columnDefs=INS_COLS, defaultColDef=DEF,
                           dashGridOptions=dict(GRID, domLayout="autoHeight"), className="g", style={"height": "auto"})),
-        html.Div(_block("Ценные бумаги", "облигации, акции, фонды — по ISIN; позиция и оценка — на концах справок",
+        html.Div(_block("Ценные бумаги", HINTS["sec"],
                         dag.AgGrid(id="g-sec", columnDefs=SEC_COLS, defaultColDef=DEF,
                                    dashGridOptions=dict(GRID, domLayout="autoHeight"), className="g",
                                    style={"height": "auto"}),
                         html.Div(id="sec-notes", className="notes")), id="sec-wrap", style={"display": "none"}),
-        _block("По дням", "стоимость счёта точна в дни справок, между ними (курсив) — оценка",
+        _block("По дням", HINTS["days"],
                html.Div([dcc.RadioItems(id="d-mode", options=[{"label": "день", "value": "day"},
                                                               {"label": "неделя", "value": "week"},
                                                               {"label": "месяц", "value": "month"}],
                                         value="day", inline=True, className="seg"),
-                         html.Button("CSV", id="d-csv", className="btn"),
                          # сброс запомненных колонок (обработчик — assets/brep-cols.js)
                          html.Button("Сбросить колонки", id="cols-reset", className="btn",
                                      title="Вернуть ширину и порядок колонок всех трёх таблиц отчёта к виду по "
@@ -292,22 +401,13 @@ def mount(server, url_base: str, account: str, reports_dir: str, cache_dir: str,
     def _head(_):
         acc = acc_or_none()
         if acc is None or not acc.reports:
-            msg = store.error or f"справок счёта {account} пока нет"
-            return "Отчёт брокера", msg, [], None, "", ""
+            return "Отчёт брокера", empty_msg(acc, store, account), [], None, "", ""
         years = sorted({r["date"][:4] for r in acc.days})
         opts = [{"label": "всё", "value": "all"}] + [{"label": y, "value": y} for y in years] + \
                [{"label": "свой период", "value": "custom"}]
-        ok = not acc.recon_bad and not acc.go_bad
-        checks = [html.Span("✓ " if ok else "⚠ ", className="ok" if ok else "bad"),
-                  f"сверка с итогами брокера: {len(acc.reports) - len(acc.recon_bad)} из {len(acc.reports)} справок, "
-                  f"9 видов денег"]
-        meta = f"справок {len(acc.reports)} · {ru(acc.first)} – {ru(acc.last)}"
-        foot = [html.P("Деньги — оплаченные рублёвые строки справок; по каждой справке их сумма по видам сверена с "
-                       "итогами брокера «Виды движений денежных средств». Прибыль = изменение стоимости счёта без "
-                       "ввода и вывода между ближайшими точными точками (начало/конец справок).")] + \
-               [html.P("Замечания: " + "; ".join(acc.notes))] * bool(acc.notes) + \
-               [html.P("⚠ Не сошлось со справкой: " + str(acc.recon_bad + acc.go_bad), className="bad")] * (not ok) + \
-               [html.P("⚠ " + store.error, className="bad")] * bool(store.error)
+        meta, chk, ft = head_info(acc, store.error)    # текст и условия ✓/⚠ — общие с файлом HTML (brep_export)
+        checks = [html.Span(t, className=c) if c else t for t, c in chk]
+        foot = [html.P(t, className=c) if c else html.P(t) for t, c in ft]
         return f"Отчёт брокера · {acc.account_no}", meta, opts, "all", checks, foot
 
     @app.callback(Output("d-from", "value"), Output("d-to", "value"), Input("preset", "value"))
@@ -328,12 +428,9 @@ def mount(server, url_base: str, account: str, reports_dir: str, cache_dir: str,
         if acc is None or not acc.reports:
             return [], [], ""
         a, b = rng(acc, a, b)
-        ys = acc.years(a, b)
-        tot = acc.summary(a, b, "Итого")
-        notes = [f"{s['label']}: {s['note']}" for s in ys + ([tot] if tot else []) if s["note"]]
-        cols, rows = summary_table([(s["label"], s) for s in ys] + ([("Итого", tot)] if tot and len(ys) != 1 else []))
-        return cols, rows, ("Границы по справкам — " + "; ".join(notes) + ": стоимость счёта известна только на "
-                            "концах справок, справка за период внутри себя по стоимости не делится.") if notes else ""
+        cols_data, note = sum_data(acc, a, b)
+        cols, rows = summary_table(cols_data)
+        return cols, rows, note
 
     @app.callback(Output("g-d", "rowData"), Output("g-d", "dashGridOptions"),
                   Input("d-from", "value"), Input("d-to", "value"), Input("d-mode", "value"))
@@ -353,10 +450,7 @@ def mount(server, url_base: str, account: str, reports_dir: str, cache_dir: str,
             return [], dict(GRID, domLayout="autoHeight")
         a, b = rng(acc, a, b)
         rows = acc.instruments(a, b, mode == "base")
-        tot = {"instr": "Итого"}
-        for f in ("vm", "exch", "broker", "net", "lots", "deals"):
-            tot[f] = round(sum(r[f] for r in rows), 2)
-        return rows, dict(GRID, domLayout="autoHeight", pinnedBottomRowData=[tot])
+        return rows, dict(GRID, domLayout="autoHeight", pinnedBottomRowData=[ins_total(rows)])
 
     @app.callback(Output("g-d", "exportDataAsCsv"), Input("d-csv", "n_clicks"), prevent_initial_call=True)
     def _csv(_):
@@ -368,23 +462,21 @@ def mount(server, url_base: str, account: str, reports_dir: str, cache_dir: str,
     def _sec(a, b):
         acc = acc_or_none()
         hide = {"display": "none"}
-        if acc is None or not acc.reports or not (acc.p_names or acc.p_trades or acc.p_fx):
+        if not sec_visible(acc):
             return [], dict(GRID, domLayout="autoHeight"), "", hide       # бумаг за всю историю нет — блок не показываем
         a, b = rng(acc, a, b)
         sec = acc.securities(a, b)
         if sec is None:
             return [], dict(GRID, domLayout="autoHeight"), "за выбранный период справок нет", {}
         rows, pin = sec_rows(sec)
-        notes = [f"По справкам: {ru(bp_day_after(sec['from']))} – {ru(sec['to'])}. Позиция — «плановый остаток» брокера: "
-                 "с купленным, но ещё не поставленным, и с бумагами, выданными брокеру в займ; сделки — по дате сделки."]
-        if sec["lend"]:
-            notes.append(f"Займ ЦБ брокеру: {sec['lend']} операций выдачи/возврата за всё время — в количестве и "
-                         "результате не участвуют (бумага на займе остаётся вашей).")
-        if sec["bad"]:
-            notes.append("⚠ Количество не сошлось: " + ", ".join(sec["bad"]) + " — результат по ним неточен.")
-        if sec["unknown"]:
-            notes.append("⚠ Не распознано строк справок: " + "; ".join(f"{k} — {v}" for k, v in sec["unknown"].items()))
         return rows, dict(GRID, domLayout="autoHeight", pinnedBottomRowData=pin), \
-            [html.P(n, className="bad" if n.startswith("⚠") else None) for n in notes], {}
+            [html.P(n, className="warn" if n.startswith("⚠") else None)   # «не сошлось» — жёлтым
+             for n in sec_notes(sec)], {}
+
+    # отчёт одним файлом HTML (таблицы + графики) — скачивается на диск (brep_export)
+    @app.callback(Output("d-html", "href"), Input("d-from", "value"), Input("d-to", "value"),
+                  Input("d-mode", "value"), Input("i-mode", "value"))
+    def _html_href(a, b, mode, imode):
+        return export_href(a, b, mode, imode)
 
     return app, store

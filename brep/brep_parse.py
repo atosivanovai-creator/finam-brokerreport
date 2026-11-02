@@ -12,11 +12,16 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import threading
 
 from .htables import tables
 
 DATE = re.compile(r"^(\d\d)\.(\d\d)\.(\d{4})$")
 ISO = re.compile(r"^\d{4}-\d\d-\d\d$")
+#: счётчик непустых нечисловых ячеек в числовых полях текущего разбора (у потока — свой)
+_tl = threading.local()
+NONNUM = "нечисловых ячеек в числовых полях (взято 0)"
+_DASH = {"-", "\u2013", "\u2014"}
 
 
 def num(s: str) -> float:
@@ -24,6 +29,10 @@ def num(s: str) -> float:
     try:
         return float(s)
     except ValueError:
+        # пусто/прочерк — 0, как было; иное (скобки, «руб.», новая форма числа) — тоже 0 (числа не меняем),
+        # но не молча: счётчик уходит в unknown справки и в шапку отчёта
+        if s and s not in _DASH and getattr(_tl, "n", None) is not None:
+            _tl.n += 1
         return 0.0
 
 
@@ -83,6 +92,17 @@ def _nontrade_kind(typ: str, comment: str, amount: float) -> str:
 
 
 def parse_report(text: str, name: str = "") -> dict:
+    _tl.n = 0
+    try:
+        r = _parse_report(text, name)
+        if _tl.n:
+            r["unknown"][NONNUM] = r["unknown"].get(NONNUM, 0) + _tl.n
+        return r
+    finally:
+        _tl.n = None
+
+
+def _parse_report(text: str, name: str = "") -> dict:
     tabs = tables(text)
     if not tabs:
         raise ValueError("нет таблиц")
@@ -99,8 +119,8 @@ def parse_report(text: str, name: str = "") -> dict:
     st = {}
     for row in _find(tabs, "1. Оценка состояния"):
         if len(row) >= 3:
-            st[row[0]] = (num(row[1]), num(row[2]))
-    pick = lambda pref: next((v for k, v in st.items() if k.startswith(pref)), (0.0, 0.0))
+            st[row[0]] = (row[1], row[2])        # в число — только взятые строки (заголовки не считаем)
+    pick = lambda pref: next(((num(a), num(b)) for k, (a, b) in st.items() if k.startswith(pref)), (0.0, 0.0))
     r["equity"] = pick("ИТОГО оценка")
     r["rub"] = pick("Оценка рублевой")
     r["go"] = pick("Оценка позиции по ПФИ")
@@ -110,9 +130,15 @@ def parse_report(text: str, name: str = "") -> dict:
         raise ValueError("не справка: нет итога оценки счёта")
     # Виды движений: итоги брокера (рубль)
     f = {}
-    for row in _find(tabs, "Виды движений"):
+    ftab = _find(tabs, "Виды движений")
+    for row in ftab:
+        if row and row[0] == "Рубль" and len(row) not in (18, 20):
+            # новая раскладка итогов — не молча мимо (иначе 0 = 0 и зелёная «сверка ✓»)
+            k = f"Виды движений: {len(row)} ячеек"
+            r["unknown"][k] = r["unknown"].get(k, 0) + 1
+            continue
         if row and row[0] == "Рубль" and len(row) in (18, 20):
-            v = [num(x) for x in row]
+            v = [0.0] + [num(x) for x in row[1:]]    # [0] — «Рубль», не число (в счётчик не идёт)
             n = 4 if len(row) == 20 else 3      # 18 ячеек — старая раскладка (до 2022): без колонок драгметаллов
             if n == 3:
                 v = v[:6] + [0.0] + v[6:9] + [0.0] + v[9:]
@@ -120,6 +146,8 @@ def parse_report(text: str, name: str = "") -> dict:
                  "go_chg": v[12], "exch": v[13], "income": v[14], "broker": v[15], "advisor": v[16],
                  "tax": v[17] + v[18], "tax_paid": v[17], "tax_withheld": v[18], "other": v[19]}
     r["flows"] = f
+    # таблица итогов есть, а рублёвых итогов из неё не взяли — сверять не с чем: «сверка невозможна», не ✓
+    r["recon_na"] = "итоги «Виды движений» не распознаны" if ftab and not f else ""
     items = r["items"]
 
     def add(date, kind, amount, instr="", comment="", src=""):
@@ -147,7 +175,11 @@ def parse_report(text: str, name: str = "") -> dict:
     # Торговые движения ПФИ
     vm_agg, ex_agg = {}, {}
     for row in _find(tabs, "Торговые движения ПФИ"):
-        if len(row) not in (18, 25) or not DATE.match(row[0]):
+        if not DATE.match(row[0] if row else ""):
+            continue
+        if len(row) not in (18, 25):                 # неизвестная раскладка — в счётчик, не молча мимо
+            k = f"ПФИ: {len(row)} ячеек"
+            r["unknown"][k] = r["unknown"].get(k, 0) + 1
             continue
         new = len(row) == 25             # формат с 16.10.2026: колонки задолженностей и дат оплаты
         c_go, c_paid, c_no, c_cm = (13, 17, 23, 24) if new else (11, 13, 16, 17)

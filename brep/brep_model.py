@@ -15,7 +15,13 @@
 """
 from __future__ import annotations
 
+import bisect
 import datetime as dt
+try:
+    import fcntl                                  # Linux, macOS
+except ImportError:                               # Windows
+    fcntl = None
+    import msvcrt
 import glob
 import json
 import os
@@ -25,8 +31,10 @@ from collections import defaultdict
 
 from . import brep_parse as bp
 
-CACHE_V = 4          # 4: НДФЛ с процентов на остаток — днём выплаты, проценты «к выплате» (28.10.2026)
-# прежние версии: 2: lots_late (склейка справок); 3: papers — бумаги по ISIN, валюта, unknown; req без денег по бумагам
+CACHE_V = 6          # 6: счётчик нечисловых ячеек в unknown
+# прежние версии: 2: lots_late (склейка справок); 3: papers — бумаги по ISIN, валюта, unknown; req без денег по бумагам;
+# 4: НДФЛ с процентов на остаток — днём выплаты, проценты «к выплате»; 5: recon_na, неизвестная
+# ширина строк ПФИ/итогов → unknown
 INCOME = (bp.KIND_COUPON, bp.KIND_INTEREST)
 FLOWS = (bp.KIND_IN, bp.KIND_OUT, bp.KIND_TR)
 
@@ -63,7 +71,7 @@ def compact(r: dict) -> dict:
     rnd = lambda x: round(x, 2)  # noqa: E731
     return {
         "file": r["file"], "from": r["from"], "to": r["to"], "account": r["account"],
-        "equity": r["equity"], "go": r["go"], "recon": r["recon"],
+        "equity": r["equity"], "go": r["go"], "recon": r["recon"], "recon_na": r.get("recon_na", ""),
         # «Оценка требований и обязательств» без денег по непоставленным БУМАГАМ: по ней сводка доначисляет ВМ
         # (начисленная, но не оплаченная), а деньги за бумагу 30.12 с оплатой 03.01 — не ВМ (их учитывает блок бумаг)
         "req": [round(x - y, 2) for x, y in zip(r["req"], (r.get("papers") or {}).get("req_sec", [0.0, 0.0]))],
@@ -115,10 +123,39 @@ def compact_papers(r: dict) -> dict:
             "fx": list(r.get("fx") or (0.0, 0.0)), "fx_flows": fx}
 
 
-def _load(path: str, cache_dir: str) -> dict:
-    st = os.stat(path)
-    key = os.path.join(cache_dir, os.path.basename(path) + ".json")
-    sig = [CACHE_V, int(st.st_mtime), st.st_size]
+_CHARSET = re.compile(rb"""charset\s*=\s*["']?([A-Za-z0-9_\-]+)""", re.I)
+
+
+def _texts(blob: bytes) -> list[str]:
+    """Тексты справки для разбора, по порядку. Прежде всегда utf-8 с заменой — ручная справка в
+    cp1251 давала «нет периода». UTF-8 (с BOM или без) — как прежде, один вариант; не UTF-8 — сперва по <meta charset>
+    (нет — cp1251, кодировка кабинета Финама), затем прежний utf-8 с заменой (почти-UTF-8 с битым байтом)."""
+    if blob.startswith(b"\xef\xbb\xbf"):
+        return [blob[3:].decode("utf-8", errors="replace")]
+    try:
+        return [blob.decode("utf-8")]
+    except UnicodeDecodeError:
+        pass
+    m = _CHARSET.search(blob[:4096])
+    enc = m.group(1).decode("ascii", "replace").lower() if m else "cp1251"
+    try:
+        first = blob.decode(enc, errors="replace")
+    except LookupError:
+        first = blob.decode("cp1251", errors="replace")
+    return [first, blob.decode("utf-8", errors="replace")]
+
+
+def _parse_blob(blob: bytes, name: str) -> dict:
+    err = None
+    for text in _texts(blob):
+        try:
+            return bp.parse_report(text, name)
+        except ValueError as e:                 # «не справка: нет периода» и т.п. — пробуем следующую кодировку
+            err = e
+    raise err
+
+
+def _read_cache(key: str, sig: list):
     try:
         with open(key, encoding="utf-8") as f:
             c = json.load(f)
@@ -126,16 +163,86 @@ def _load(path: str, cache_dir: str) -> dict:
             return c["r"]
     except (OSError, ValueError):
         pass
-    with open(path, encoding="utf-8-sig", errors="replace") as f:
-        r = bp.parse_report(f.read(), os.path.basename(path))
-    r["recon"] = bp.reconcile(r)
-    c = compact(r)
+    return None
+
+
+def _lock(f) -> bool:
+    """Исключительный замок открытого файла (ждать). False — замок не взят: работать без него."""
+    try:
+        if fcntl is not None:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        else:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)   # ждёт до ~10 с, затем OSError
+        return True
+    except OSError:
+        return False
+
+
+def _unlock(f) -> None:
+    try:
+        if fcntl is not None:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        else:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+def _load(path: str, cache_dir: str) -> dict:
+    st = os.stat(path)
+    key = os.path.join(cache_dir, os.path.basename(path) + ".json")
+    sig = [CACHE_V, int(st.st_mtime), st.st_size]
+    c = _read_cache(key, sig)
+    if c is not None:
+        return c
     os.makedirs(cache_dir, mode=0o700, exist_ok=True)
-    tmp = f"{key}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"sig": sig, "r": c}, f, ensure_ascii=False)
-    os.replace(tmp, key)
+    # 3 окна счёта открыли отчёт одновременно — разбирает одно, остальные ждут замок файла
+    # и берут готовый кэш (прежде каждое разбирало справку само: до 100 МБ, секунды CPU и сотни МБ в каждом окне)
+    with open(key + ".lock", "a") as lk:
+        held = _lock(lk)                          # без замка — как прежде (каждый разберёт сам)
+        try:
+            c = _read_cache(key, sig)
+            if c is not None:
+                return c
+            with open(path, "rb") as f:
+                r = _parse_blob(f.read(), os.path.basename(path))
+            r["recon"] = bp.reconcile(r)
+            c = compact(r)
+            tmp = f"{key}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"sig": sig, "r": c}, f, ensure_ascii=False)
+            os.replace(tmp, key)
+        finally:
+            if held:
+                _unlock(lk)
     return c
+
+
+#: справки, которые не разобрались, — (путь, mtime, размер, CACHE_V) → причина. Повторно не
+#: разбираются, пока файл не изменится (прежде битый файл разбирался заново на каждый запрос окна).
+_BAD: dict = {}
+_BAD_MAX = 256
+
+
+def _load_safe(path: str, cache_dir: str):
+    """→ (итоги справки, None) или (None, причина). Один битый/чужой файл не гасит отчёт счёта."""
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        return None, f"{type(e).__name__}: {e}"
+    bk = (path, int(st.st_mtime), st.st_size, CACHE_V)
+    if bk in _BAD:
+        return None, _BAD[bk]
+    try:
+        return _load(path, cache_dir), None
+    except Exception as e:  # noqa: BLE001 — справка не разобралась: пропуск с пометкой
+        why = f"{type(e).__name__}: {e}"[:200]
+        if len(_BAD) >= _BAD_MAX:
+            _BAD.clear()
+        _BAD[bk] = why
+        return None, why
 
 
 def _days(a: str, b: str) -> list[str]:
@@ -230,7 +337,13 @@ class Account:
     def __init__(self, acc: str, data_dir: str, cache_dir: str):
         self.acc = acc
         self.sig = dir_signature(data_dir, acc)
-        reps = [_load(os.path.join(data_dir, acc, n), os.path.join(cache_dir, acc)) for n, _, _ in self.sig]
+        reps, self.bad_files = [], []
+        for n, _, _ in self.sig:                 # битый файл — пропуск с пометкой, не весь отчёт
+            c, why = _load_safe(os.path.join(data_dir, acc, n), os.path.join(cache_dir, acc))
+            if c is None:
+                self.bad_files.append((n, why))
+            else:
+                reps.append(c)
         reps.sort(key=lambda r: (r["from"], r["to"]))
         self.notes: list[str] = []
         kept = []
@@ -246,6 +359,8 @@ class Account:
         self.account_no = next((r["account"] for r in kept if r["account"]), acc)
         self.recon_bad = [(r["file"], {k: v for k, v in r["recon"].items() if abs(v[2]) > 0.01})
                           for r in kept if any(abs(v[2]) > 0.01 for v in r["recon"].values())]
+        # справки, где итоги брокера не разобраны (новая раскладка) — сверки нет, «✓» за них не ставится
+        self.recon_na = [(r["file"], r["recon_na"]) for r in kept if r.get("recon_na")]
         for a, b in zip(kept, kept[1:]):
             miss = [d for d in _days(a["to"], b["from"])[1:-1] if dt.date.fromisoformat(d).weekday() < 5]
             if miss:
@@ -552,6 +667,21 @@ def _papers_init(self, kept):
         self.p_fx += p.get("fx_flows", [])
 
 
+def _in_range(self, name: str, obj, items, date_of, lo: str, hi: str) -> list:
+    """Строки бумаг с датой в (lo, hi] — в ИСХОДНОМ порядке (порядок сложения прежний, числа те же).
+    Прежде каждый вызов securities() перебирал все строки счёта, а parts_days() зовёт его на каждом
+    конце справки ⇒ O(справок × строк) при первом открытии «Графиков». Индекс по дате — один раз на список."""
+    idx = self.__dict__.setdefault("_pidx", {})
+    ent = idx.get(name)
+    if ent is None or ent[0] is not obj or ent[1] != len(obj):
+        seq = list(items())
+        order = sorted((date_of(x), n) for n, x in enumerate(seq) if date_of(x))
+        ent = idx[name] = (obj, len(obj), seq, [d for d, _ in order], [n for _, n in order])
+    _, _, seq, ds, ns = ent
+    a, b = bisect.bisect_right(ds, lo), bisect.bisect_right(ds, hi)
+    return [seq[n] for n in sorted(ns[a:b])]
+
+
 def _securities(self, a: str, b: str):
     """Ценные бумаги за интервал между точными точками (концами справок), по ISIN.
     Результат = оценка на конец − на начало + продажи − покупки + погашения + купоны/дивиденды + депозитарий за выплату
@@ -564,7 +694,6 @@ def _securities(self, a: str, b: str):
     pS, pE = self.point_at(bp.day_before(a)), self.point_at(b)
     if pE[0] <= pS[0]:
         return None
-    inside = lambda d: d and pS[0] < d <= pE[0]  # noqa: E731
     h0, t0, fx0 = self.p_at.get(pS[0], ({}, 0.0, 0.0))
     h1, t1, fx1 = self.p_at.get(pE[0], ({}, 0.0, 0.0))
     z = lambda: {"q0": 0.0, "v0": 0.0, "bq": 0.0, "b": 0.0, "sq": 0.0, "s": 0.0, "red": 0.0, "inc": 0.0,  # noqa: E731
@@ -575,10 +704,9 @@ def _securities(self, a: str, b: str):
     for i, (q, v) in h1.items():
         g[i]["q1"], g[i]["v1"] = q, v
     vol = defaultdict(lambda: defaultdict(float))
-    for t in self.p_trades.values():
+    rng = lambda name, obj, it, date_of: _in_range(self, name, obj, it, date_of, pS[0], pE[0])  # noqa: E731
+    for t in rng("trades", self.p_trades, self.p_trades.values, lambda t: t[0]):
         d, i, side, q, money = t[:5]                             # по дате сделки: позиция — плановый остаток
-        if not inside(d):
-            continue
         x = g[i]
         x["deals"] += 1
         if side > 0:
@@ -589,22 +717,17 @@ def _securities(self, a: str, b: str):
             x["s"] += money
         vol[d][i] += abs(money)                                  # комиссия брокера датирована днём сделки
     unalloc = 0.0
-    for d, v in self.p_comm.items():
-        if not inside(d):
-            continue
+    for d, v in rng("comm", self.p_comm, self.p_comm.items, lambda x: x[0]):
         tot = sum(vol[d].values())
         if not tot:
             unalloc += v
             continue
         for i, w in vol[d].items():
             g[i]["comm"] += v * w / tot
-    for d, i, _op, cr, db in self.p_moves:
-        if inside(d):
-            g[i]["mq"] += cr - db
+    for d, i, _op, cr, db in rng("moves", self.p_moves, self.p_moves.__iter__, lambda m: m[0]):
+        g[i]["mq"] += cr - db
     cash_un = 0.0
-    for d, i, k, amt in self.p_cash:
-        if not inside(d):
-            continue
+    for d, i, k, amt in rng("cash", self.p_cash, self.p_cash.__iter__, lambda c: c[0]):
         if not i:
             cash_un += amt
             continue
@@ -618,11 +741,12 @@ def _securities(self, a: str, b: str):
         rows.append({"name": self.p_names.get(i, i), "isin": i, **{k: round(v, 2) for k, v in x.items()},
                      "result": round(res, 2), "dq": round(dq, 6), "ok": abs(dq) < 1e-6})
     rows.sort(key=lambda r: (-abs(r["result"]), r["name"]))
-    fxb = sum(f[3] for f in self.p_fx if inside(f[0]) and f[1] == bp.KIND_FX_BUY)
-    fxs = sum(f[3] for f in self.p_fx if inside(f[0]) and f[1] == bp.KIND_FX_SELL)
+    fx_in = rng("fx", self.p_fx, self.p_fx.__iter__, lambda f: f[0])
+    fxb = sum(f[3] for f in fx_in if f[1] == bp.KIND_FX_BUY)
+    fxs = sum(f[3] for f in fx_in if f[1] == bp.KIND_FX_SELL)
     fx = None
     if fxb or fxs or fx0 or fx1:
-        fx = {"name": "Валюта (по курсу ЦБ)", "isin": ", ".join(sorted({f[2] for f in self.p_fx if inside(f[0])})),
+        fx = {"name": "Валюта (по курсу ЦБ)", "isin": ", ".join(sorted({f[2] for f in fx_in})),
               "v0": round(fx0, 2), "b": round(-fxb, 2), "s": round(fxs, 2), "v1": round(fx1, 2),
               "result": round(fx1 - fx0 + fxs + fxb, 2), "ok": True}
     return {"rows": rows, "fx": fx, "from": pS[0], "to": pE[0], "tot0": t0, "tot1": t1, "lend": self.p_lend,
@@ -710,17 +834,21 @@ class Store:
         self.acc, self.data_dir, self.cache_dir = acc, data_dir, cache_dir
         self._lock = threading.Lock()
         self._a: Account | None = None
+        self._bad_sig = None
         self.error = ""
 
     def get(self) -> Account | None:
         sig = dir_signature(self.data_dir, self.acc)
         if self._a is not None and self._a.sig == sig:
             return self._a
+        if sig == self._bad_sig:                  # сборка падала на этом составе — не пересобирать на каждом запросе
+            return self._a
         with self._lock:
-            if self._a is None or self._a.sig != sig:
+            if (self._a is None or self._a.sig != sig) and sig != self._bad_sig:
                 try:
                     self._a = Account(self.acc, self.data_dir, self.cache_dir)
-                    self.error = ""
+                    self.error, self._bad_sig = "", None
                 except Exception as e:  # noqa: BLE001 — окно не должно падать из-за справки
                     self.error = f"{type(e).__name__}: {e}"
+                    self._bad_sig = sig
         return self._a

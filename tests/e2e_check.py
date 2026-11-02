@@ -68,6 +68,20 @@ sec = s.post(b + "_dash-update-component", json=body).json()["response"]
 rows = sec["g-sec"]["rowData"]
 print("3 securities:", [(r["name"], r.get("q1"), r.get("chk"), round(r.get("result") or 0)) for r in rows])
 assert len(rows) == 2 and all(r.get("chk") == "✓" for r in rows) and sec["sec-wrap"]["style"] == {}, rows
+
+# выгрузка отчёта одним файлом HTML: кнопки в шапке, файл — вложение (на диск), таблицы + графики, без внешних загрузок
+for a in accs:
+    b = f"{U}/a/{a}/broker-report/"
+    head = json.dumps(s.get(b + "_dash-layout").json()["props"]["children"][0], ensure_ascii=False)
+    assert '"d-html"' in head and '"d-csv"' in head, "кнопки CSV и HTML должны быть в шапке"
+    r = s.get(b + "export.html?mode=week")
+    cd = r.headers.get("Content-Disposition", "")
+    doc = r.text
+    assert r.status_code == 200 and cd.startswith("attachment;") and ".html" in cd, (r.status_code, cd)
+    assert doc.count('class="t ') >= 3 and doc.count("Plotly.newPlot") >= 4, "в файле нет таблиц или графиков"
+    assert not re.search(r'<(script|link|img)[^>]+(src|href)="https?://', doc), "внешняя загрузка в файле"
+    assert a != sec_acc or "Ценные бумаги" in doc
+    print(a, "export:", round(len(r.content) / 1e6, 1), "МБ,", doc.count("Plotly.newPlot"), "графиков")
 assert s.post(U + "/delete/2", data={"t": tok}).status_code in (200, 302)
 assert s.post(U + f"/delete/{sec_acc}", data={"t": tok}).status_code in (200, 302)
 assert re.findall(r"href='/a/(\w+)/broker-report/'", s.get(U + "/").text) == ["1"]

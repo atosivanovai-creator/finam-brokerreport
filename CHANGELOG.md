@@ -2,6 +2,12 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.1.0] — 2026-11-02
+
+- Отчёт за выбранный период скачивается одним файлом HTML — таблицы и графики, открывается без программы.
+- Повреждённая справка больше не скрывает отчёт: она пропускается с пометкой.
+- Если брокер изменит форму справки, программа предупредит, а не покажет ложную сверку.
+
 ## [1.0.6] — 2026-10-30
 
 - В отчёт добавлены новые инструменты.
@@ -34,6 +40,7 @@
 
 - Первая версия.
 
+[1.1.0]: https://github.com/atosivanovai-creator/broker-report/compare/v1.0.6...v1.1.0
 [1.0.6]: https://github.com/atosivanovai-creator/broker-report/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/atosivanovai-creator/broker-report/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/atosivanovai-creator/broker-report/compare/v1.0.3...v1.0.4

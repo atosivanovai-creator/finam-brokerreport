@@ -422,8 +422,8 @@ def kpi_values(s: dict) -> dict:
             "dep": sum(x for x in fl if x > 0), "wd": sum(x for x in fl if x < 0), "eq": s["equity"][-1]}
 
 
-def kpi(s: dict) -> list:
-    from dash import html
+def kpi_items(s: dict) -> list:
+    """Плашки итогов периода [(подпись, значение, класс знака, главная)] — окно «Графики» и файл HTML отчёта."""
     if not s["dates"]:
         return []
     k = kpi_values(s)
@@ -434,8 +434,26 @@ def kpi(s: dict) -> list:
              ("прибыль", rub(k["profit"]) + " ₽", cls(k["profit"]), False),
              (f"стоимость на {ru_date(s['dates'][-1])}", rub(k["eq"]) + " ₽", "", False),
              ("ввод · вывод", f"{rub(k['dep'])} · {rub(k['wd'])} ₽", "", False)]
-    return [html.Div([html.I(n), html.B(v, className=c)], className="k main" if m else "k") for n, v, c, m in items]
+    return items
 
+
+def kpi(s: dict) -> list:
+    from dash import html
+    return [html.Div([html.I(n), html.B(v, className=c)], className="k main" if m else "k") for n, v, c, m in kpi_items(s)]
+
+
+# блоки под главным графиком: (заголовок, пояснение, id) — окно «Графики» и файл HTML отчёта (brep_export)
+CHART_BLOCKS = (
+    ("Доходность по месяцам, %", "индекс доходности: конец месяца к концу прошлого; «год» — произведение месяцев периода",
+     "c-months"),
+    ("Затраты", "из чего сложилась прибыль периода; затраты брокера и биржи по месяцам и на один лот", "c-costs"),
+    ("Инструменты", ("фьючерсы по базовому активу (комиссия брокера за день делится по лотам дня, как во "
+                     "вкладке «По инструментам»), ценные бумаги, валюта, проценты на остаток, налоги; переоценка "
+                     "бумаг и начисленная ВМ — на концах справок; сумма линий = прибыль"), "c-ins"))
+CHARTS_NOTE = ("Доходность — индекс без влияния ввода и вывода (тот же расчёт, что «% за период» сводки отчёта): в начале "
+               "выбранного периода 0 %. Стоимость счёта точна на концах справок (точки), между ними — оценка; на концах "
+               "справок линия выравнивается к точной стоимости (переоценка бумаг/валюты).")
+CHART_CONFIG = {"displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "select2d"]}
 
 CSS = """.kpi{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 8px}.k{border:1px solid var(--line);border-radius:8px;padding:6px 12px}
 .k b{display:block;font-size:15px}.k.main b{font-size:20px}.k i{font-style:normal;color:var(--mut);font-size:11.5px}
@@ -460,20 +478,12 @@ def mount(server, url_base: str, account: str, store, report_url: str):
                   dcc.RadioItems(id="c-scale", options=[{"label": "обычная", "value": "lin"}, {"label": "лог", "value": "log"}],
                                  value="lin", inline=True, className="seg")], className="bar"),
         html.Div(id="c-kpi", className="kpi"),
-        html.Div(dcc.Graph(id="c-fig", config={"displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "select2d"]},
+        html.Div(dcc.Graph(id="c-fig", config=CHART_CONFIG,
                            style={"height": "860px"}), className="chart"),
         *[html.Section([html.Div([html.H2(h), html.Span(n, className="hint")], className="bh"),
-                        dcc.Graph(id=i, config={"displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "select2d"]})],
-                       className="card") for h, n, i in (
-            ("Доходность по месяцам, %", "индекс доходности: конец месяца к концу прошлого; «год» — произведение месяцев периода",
-             "c-months"),
-            ("Затраты", "из чего сложилась прибыль периода; затраты брокера и биржи по месяцам и на один лот", "c-costs"),
-            ("Инструменты", "фьючерсы по базовому активу (комиссия брокера за день делится по лотам дня, как во "
-                            "вкладке «По инструментам»), ценные бумаги, валюта, проценты на остаток, налоги; переоценка "
-                            "бумаг и начисленная ВМ — на концах справок; сумма линий = прибыль", "c-ins"))],
-        html.P("Доходность — индекс без влияния ввода и вывода (тот же расчёт, что «% за период» сводки отчёта): в начале "
-               "выбранного периода 0 %. Стоимость счёта точна на концах справок (точки), между ними — оценка; на концах "
-               "справок линия выравнивается к точной стоимости (переоценка бумаг/валюты).", className="hint"),
+                        dcc.Graph(id=i, config=CHART_CONFIG)],
+                       className="card") for h, n, i in CHART_BLOCKS],
+        html.P(CHARTS_NOTE, className="hint"),
         dcc.Store(id="c-skin"),
     ], className="page")
 

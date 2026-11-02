@@ -1,6 +1,6 @@
 :root{--bg:#0a0e15;--card:#111722;--line:#1f2938;--txt:#e6ebf3;--mut:#8e9ab0;--acc:#22c3ee;
 --hdr:color-mix(in srgb,var(--card),var(--txt) 6%);--odd:color-mix(in srgb,var(--card),var(--txt) 2.5%);
---hover:color-mix(in srgb,var(--card),var(--acc) 12%);--okt:#5ee0a0;--badt:#ff6b7a;
+--hover:color-mix(in srgb,var(--card),var(--acc) 12%);--okt:#5ee0a0;--badt:#ff6b7a;--warnt:#ffc857;
 --htxt:color-mix(in srgb,var(--txt) 72%,var(--mut));--hline:color-mix(in srgb,var(--line),var(--acc) 45%)}
 html,body{background:var(--card)}
 body{margin:0;color:var(--txt);font:13px/1.4 "IBM Plex Sans",system-ui,Segoe UI,Roboto,sans-serif}
@@ -19,7 +19,7 @@ nav a.on{color:var(--txt);border-color:var(--acc)}
 .seg label{display:inline-block;margin-right:4px;padding:3px 10px;border:1px solid var(--line);border-radius:6px;cursor:pointer;color:var(--mut)}
 .seg input{display:none}
 .seg label:has(input:checked){color:var(--txt);border-color:var(--acc);background:color-mix(in srgb,var(--card),var(--acc) 14%)}
-.checks{color:var(--mut);font-size:12px}.ok{color:var(--okt)}.bad{color:var(--badt)}
+.checks{color:var(--mut);font-size:12px}.ok{color:var(--okt)}.bad{color:var(--badt)}.warn{color:var(--warnt)}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:12px}
 .bh{display:flex;align-items:baseline;gap:12px;margin-bottom:8px}
 .tools{display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
@@ -27,6 +27,8 @@ nav a.on{color:var(--txt);border-color:var(--acc)}
 .inp.date{color-scheme:dark;width:132px}
 html[data-mode=light] .inp.date{color-scheme:light}
 .btn{cursor:pointer}.btn:hover{border-color:var(--acc)}
+a.btn{text-decoration:none}   /* ссылка-кнопка «HTML ↓» (файл отчёта) — как кнопки */
+.hbtn{display:inline-flex;align-items:center;height:28px;padding:0 10px;border-radius:8px;box-sizing:border-box}   /* CSV и «HTML ↓» в шапке — высотой как ссылки .lnk */
 .notes{color:var(--mut);font-size:12px;margin-top:6px}
 footer{color:var(--mut);font-size:12px}footer p{margin:3px 0}
 .g .neg{color:var(--badt)}.g .pos{color:var(--okt)}.g .est{font-style:italic;color:var(--mut)}
