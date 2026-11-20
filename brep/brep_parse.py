@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import re
 import threading
 
@@ -62,6 +63,7 @@ KIND_COUPON, KIND_INTEREST = "Доход: купоны, дивиденды", "Д
 TAX_WITHHELD, TAX_INTEREST = "удержан при выплате дохода", "удержан с процентов на остаток (п.14.4)"
 KIND_SEC_BUY, KIND_SEC_SELL, KIND_REDEEM, KIND_OTHER = "Бумаги: покупка", "Бумаги: продажа", "Бумаги: погашение", "Прочее"
 KIND_FX_BUY, KIND_FX_SELL = "Валюта: покупка", "Валюта: продажа"
+KIND_REPO_BUY, KIND_REPO_SELL = "РЕПО: покупка", "РЕПО: продажа"
 
 
 def _nontrade_kind(typ: str, comment: str, amount: float) -> str:
@@ -246,6 +248,44 @@ def _parse_report(text: str, name: str = "") -> dict:
         add(r["to"], KIND_TAX, rest, "", TAX_WITHHELD + "; в справке только итогом за период, без даты", "итог справки")
     r["fx"] = pick("Оценка валютной")
     r["papers"] = papers(tabs, r)
+    # Регламент: займы ЦБ не создают денежных строк. РЕПО — отдельные денежные виды,
+    # не обычные сделки бумаг/ПФИ: short и непоставленная ч.2 уже видны через plan/req_sec.
+    # В 27-колоночной форме суммы РЕПО положительные; направление задаёт вид сделки.
+    for row in _find(tabs, "в тексте Регламента брокерского обслуживания"):
+        if len(row) <= 4 or not DATE.match(row[0]):
+            continue
+        op = row[4]
+        if op in ("Выдача займа ЦБ", "Возврат выданного займа ЦБ"):
+            r["papers"]["lend"] += 1
+            continue
+        if op not in ("Покупка (РЕПО ч.1)", "Продажа (РЕПО ч.2)", "Комиссия брокерская"):
+            why = op
+        elif len(row) != 27:
+            why = f"{len(row)} ячеек"
+        elif (row[15] if op == "Комиссия брокерская" else row[11]) != "Рубль":
+            why = "расчёты в " + ((row[15] if op == "Комиссия брокерская" else row[11]) or "неизвестной валюте")
+        elif row[20] and not iso(row[20]):
+            why = "дата оплаты факт"
+        elif (row[14] if op == "Комиссия брокерская" else row[13]).strip() in ("", *_DASH):
+            why = "нет суммы"
+        elif not math.isfinite(amount := num(row[14] if op == "Комиссия брокерская" else row[13])):
+            why = "не конечная сумма"
+        elif amount < 0:
+            why = "отрицательная сумма"
+        else:
+            paid = iso(row[20])                 # не подменяем фактическую оплату планом или датой сделки
+            if op == "Комиссия брокерская":
+                add(paid, KIND_BROKER, -amount, "", row[26], "Регламент")
+            else:
+                buy = op == "Покупка (РЕПО ч.1)"
+                add(paid, KIND_REPO_BUY if buy else KIND_REPO_SELL, (-1 if buy else 1) * amount,
+                    row[3] or row[2], op, "Регламент")
+                if num(row[14]):                # образец содержит отдельную комиссию, встроенную не угадываем
+                    k = "сделки по Регламенту: комиссия в строке РЕПО"
+                    r["unknown"][k] = r["unknown"].get(k, 0) + 1
+            continue
+        k = "сделки по Регламенту: " + why
+        r["unknown"][k] = r["unknown"].get(k, 0) + 1
     return r
 
 
@@ -292,24 +332,17 @@ def papers(tabs, r: dict) -> dict:
             p["plan"][row[2]] = [num(row[3]), num(row[4]), num(row[8]), num(row[9])]
             if len(row) >= 13:          # деньги по непоставленным бумагам, руб. (7 — начало, 12 — конец)
                 p["req_sec"] = [round(p["req_sec"][0] + num(row[7]), 2), round(p["req_sec"][1] + num(row[12]), 2)]
-    # Сделки по Регламенту (займ ЦБ брокеру): бумага уходит и возвращается, деньги не движутся — в количестве и
-    # результате не участвуют (бумага на займе видна плановым остатком). Прочие операции этой таблицы — нераспознанные.
+    # Регламент разбирается отдельно в _parse_report; займ виден плановым остатком,
+    # РЕПО не попадает в обычные сделки и распределение комиссии по бумагам.
     p["lend"] = 0
-    for row in _find(tabs, "в тексте Регламента брокерского обслуживания"):
-        if len(row) > 4 and DATE.match(row[0]):
-            if row[4] in ("Выдача займа ЦБ", "Возврат выданного займа ЦБ"):
-                p["lend"] += 1
-            else:
-                k = "сделки по Регламенту: " + row[4]
-                r["unknown"][k] = r["unknown"].get(k, 0) + 1
     return p
 
 
 # какие виды строк соответствуют колонкам итогов брокера
 FLOW_MAP = {"dep": [KIND_IN], "wd": [KIND_OUT], "vm": [KIND_VM], "exch": [KIND_EXCH],
             "broker": [KIND_BROKER, KIND_DEPO], "tax": [KIND_TAX], "income": [KIND_COUPON],
-            "other": [KIND_INTEREST, KIND_REDEEM, KIND_OTHER], "sec_in": [KIND_SEC_SELL, KIND_FX_SELL],
-            "sec_out": [KIND_SEC_BUY, KIND_FX_BUY]}
+            "other": [KIND_INTEREST, KIND_REDEEM, KIND_OTHER], "sec_in": [KIND_SEC_SELL, KIND_FX_SELL, KIND_REPO_SELL],
+            "sec_out": [KIND_SEC_BUY, KIND_FX_BUY, KIND_REPO_BUY]}
 
 
 def reconcile(r: dict) -> dict:

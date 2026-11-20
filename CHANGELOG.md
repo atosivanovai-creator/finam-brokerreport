@@ -2,6 +2,11 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.1.1] — 2026-11-20
+
+- Добавлена поддержка операций РЕПО и их комиссий.
+- Исправлена обработка пересекающихся справок.
+
 ## [1.1.0] — 2026-11-02
 
 - Отчёт за выбранный период скачивается одним файлом HTML — таблицы и графики, открывается без программы.
@@ -40,6 +45,7 @@
 
 - Первая версия.
 
+[1.1.1]: https://github.com/atosivanovai-creator/broker-report/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/atosivanovai-creator/broker-report/compare/v1.0.6...v1.1.0
 [1.0.6]: https://github.com/atosivanovai-creator/broker-report/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/atosivanovai-creator/broker-report/compare/v1.0.4...v1.0.5

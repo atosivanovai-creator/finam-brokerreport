@@ -27,14 +27,14 @@ import json
 import os
 import re
 import threading
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from . import brep_parse as bp
 
-CACHE_V = 6          # 6: счётчик нечисловых ячеек в unknown
+CACHE_V = 7          # 7: оплаченные РЕПО и комиссии по Регламенту, отдельно от обычных сделок
 # прежние версии: 2: lots_late (склейка справок); 3: papers — бумаги по ISIN, валюта, unknown; req без денег по бумагам;
 # 4: НДФЛ с процентов на остаток — днём выплаты, проценты «к выплате»; 5: recon_na, неизвестная
-# ширина строк ПФИ/итогов → unknown
+# ширина строк ПФИ/итогов → unknown; 6: счётчик нечисловых ячеек в unknown
 INCOME = (bp.KIND_COUPON, bp.KIND_INTEREST)
 FLOWS = (bp.KIND_IN, bp.KIND_OUT, bp.KIND_TR)
 
@@ -44,7 +44,12 @@ def compact(r: dict) -> dict:
     day_kind = defaultdict(lambda: defaultdict(float))
     day_ins = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))       # дата → код → [ВМ, сбор]
     broker_pfi = defaultdict(float)
+    repo_cash = []
     for i in r["items"]:
+        if i["kind"] in (bp.KIND_REPO_BUY, bp.KIND_REPO_SELL):
+            # Principal is not income: retain it for reconciliation/audit, not the equity seam sum in join_overlap.
+            repo_cash.append(dict(i))
+            continue
         day_kind[i["date"]][i["kind"]] += i["amount"]
         if i["kind"] == bp.KIND_VM and i["instr"]:
             day_ins[i["date"]][i["instr"]][0] += i["amount"]
@@ -83,6 +88,7 @@ def compact(r: dict) -> dict:
         "lots_late": {p: {d: {c: v for c, v in cv.items()} for d, cv in dv.items()} for p, dv in lots_late.items()},
         "go_ch": {d: rnd(v) for d, v in go.items()},
         "papers": compact_papers(r), "unknown": dict(r.get("unknown", {})),
+        "repo_cash": repo_cash,
     }
 
 
@@ -300,6 +306,10 @@ def join_overlap(a: dict, b: dict) -> dict | None:
     for d in over:
         if b["day_kind"].get(d, {}) != a["day_kind"].get(d, {}) or b["broker_pfi"].get(d, 0) != a["broker_pfi"].get(d, 0):
             return None
+    # Row order is not identity; compare every field and retain duplicate multiplicity.
+    if Counter(tuple(sorted(i.items())) for i in a.get("repo_cash", []) if i["date"] in over) != \
+            Counter(tuple(sorted(i.items())) for i in b.get("repo_cash", []) if i["date"] in over):
+        return None
     money = sum(v for d in over for v in b["day_kind"].get(d, {}).values())
     if abs(b["equity"][0] + money - a["equity"][1]) > 1.0:
         return None
@@ -320,7 +330,8 @@ def join_overlap(a: dict, b: dict) -> dict | None:
                       "req": (a["req"][1], b["req"][1]), "day_kind": cut(b["day_kind"]), "day_ins": cut(b["day_ins"]),
                       "broker_pfi": cut(b["broker_pfi"]), "lots_paid": lots,
                       "lots_open": cut(b["lots_open"]), "go_ch": cut(b["go_ch"]), "joined": len(over),
-                      "papers": _cut_papers(b.get("papers"), a["to"])})
+                      "papers": _cut_papers(b.get("papers"), a["to"]),
+                      "repo_cash": [i for i in b.get("repo_cash", []) if i["date"] > a["to"]]})
 
 
 def _cut_papers(p: dict | None, edge: str) -> dict | None:
