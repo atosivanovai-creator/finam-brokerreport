@@ -1,6 +1,6 @@
-# BrokerReport
+# Finam BrokerReport
 
-[![CI](https://github.com/atosivanovai-creator/broker-report/actions/workflows/ci.yml/badge.svg)](https://github.com/atosivanovai-creator/broker-report/actions/workflows/ci.yml)
+[![CI](https://github.com/atosivanovai-creator/finam-brokerreport/actions/workflows/ci.yml/badge.svg)](https://github.com/atosivanovai-creator/finam-brokerreport/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
 
