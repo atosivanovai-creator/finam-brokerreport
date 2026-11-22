@@ -181,7 +181,7 @@ def summary_html(cols_data: list) -> str:
         for c in ycols:
             v = r.get(c["field"])
             cl = ["n"] + ([_sign_cls(v)] if r.get("sign") else []) + (["totc"] if c["headerName"] == "Итого" else [])
-            tds.append(f'<td{_attr("class", " ".join(x for x in cl if x))}>{html.escape(fmtv(r, v))}</td>')
+            tds.append(f'<td{_attr("class", " ".join(x for x in cl if x))}{_attr("title", r.get(c["field"] + "_tip"))}>{html.escape(fmtv(r, v))}</td>')
         body.append(f'<tr{_attr("title", r.get("tip"))}><td class="nm">{html.escape(r["name"])}</td>{"".join(tds)}</tr>')
     return f'<table class="t sum"><thead>{head}</thead><tbody>{"".join(body)}</tbody></table>'
 

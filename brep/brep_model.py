@@ -28,10 +28,11 @@ import os
 import re
 import threading
 from collections import Counter, defaultdict
+from decimal import Decimal
 
 from . import brep_parse as bp
 
-CACHE_V = 7          # 7: оплаченные РЕПО и комиссии по Регламенту, отдельно от обычных сделок
+CACHE_V = 10         # REPO source IDs, expense categories and payment status
 # прежние версии: 2: lots_late (склейка справок); 3: papers — бумаги по ISIN, валюта, unknown; req без денег по бумагам;
 # 4: НДФЛ с процентов на остаток — днём выплаты, проценты «к выплате»; 5: recon_na, неизвестная
 # ширина строк ПФИ/итогов → unknown; 6: счётчик нечисловых ячеек в unknown
@@ -45,11 +46,21 @@ def compact(r: dict) -> dict:
     day_ins = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))       # дата → код → [ВМ, сбор]
     broker_pfi = defaultdict(float)
     repo_cash = []
+    day_costs = defaultdict(lambda: defaultdict(float))
     for i in r["items"]:
         if i["kind"] in (bp.KIND_REPO_BUY, bp.KIND_REPO_SELL):
             # Principal is not income: retain it for reconciliation/audit, not the equity seam sum in join_overlap.
             repo_cash.append(dict(i))
             continue
+        category = i.get("category")
+        if category:
+            day_costs[i["date"]][category] += i["amount"]
+            if category == "other_costs" and i["kind"] == bp.KIND_INTEREST:
+                day_costs[i["date"]]["other_costs_interest"] += i["amount"]
+            if category == "unknown_costs":
+                day_costs[i["date"]]["unknown_costs_count"] += 1
+        if i["kind"] == bp.KIND_BROKER and i["src"] == "Регламент":
+            day_costs[i["date"]]["repo_commission"] += i["amount"]
         day_kind[i["date"]][i["kind"]] += i["amount"]
         if i["kind"] == bp.KIND_VM and i["instr"]:
             day_ins[i["date"]][i["instr"]][0] += i["amount"]
@@ -89,6 +100,9 @@ def compact(r: dict) -> dict:
         "go_ch": {d: rnd(v) for d, v in go.items()},
         "papers": compact_papers(r), "unknown": dict(r.get("unknown", {})),
         "repo_cash": repo_cash,
+        "repo_legs": r.get("repo_legs", []), "repo_unknown": r.get("repo_unknown", []),
+        "repo_commissions": r.get("repo_commissions", []),
+        "day_costs": {d: {k: rnd(v) for k, v in kv.items()} for d, kv in day_costs.items()},
     }
 
 
@@ -331,6 +345,7 @@ def join_overlap(a: dict, b: dict) -> dict | None:
                       "broker_pfi": cut(b["broker_pfi"]), "lots_paid": lots,
                       "lots_open": cut(b["lots_open"]), "go_ch": cut(b["go_ch"]), "joined": len(over),
                       "papers": _cut_papers(b.get("papers"), a["to"]),
+                      "day_costs": cut(b.get("day_costs", {})),
                       "repo_cash": [i for i in b.get("repo_cash", []) if i["date"] > a["to"]]})
 
 
@@ -342,6 +357,112 @@ def _cut_papers(p: dict | None, edge: str) -> dict | None:
     return dict(p, comm={d: v for d, v in p["comm"].items() if d > edge},
                 moves=[m for m in p["moves"] if m[0] > edge], cash=[c for c in p["cash"] if c[0] > edge],
                 fx_flows=[f for f in p["fx_flows"] if f[0] > edge])
+
+
+def repo_snapshots(reports):
+    """Account-wide source history; payment revises a source, never adds principal.
+
+    A spread is disclosed at the first exact report boundary proving both legs
+    and a paid first leg. Later amount corrections are signed deltas of the same
+    cost/income component. Unproved opening balances and ambiguous multiplicity
+    stay unknown. No allocation to strategy ownership is involved.
+    """
+    groups, blocked, history = {}, set(), []
+    commissions = {}
+    blocked_commissions = set()
+    bad_dates = set()
+    for report in reports:
+        local = defaultdict(lambda: defaultdict(list))
+        for leg in report.get("repo_legs", []):
+            key = (leg["date"], leg["time"], leg["isin"])
+            local[key][leg["part"]].append(leg)
+        bad_dates.update(d or report["from"] for d in report.get("repo_unknown", []))
+        for key, parts in local.items():
+            group = groups.setdefault(key, {})
+            for part, legs in parts.items():
+                if len(legs) != 1:
+                    blocked.add(key)
+                    continue
+                leg = legs[0]
+                old = group.get(part)
+                if old and (old["qty"] != leg["qty"] or old["side"] != leg["side"]
+                            or old["source_id"] and leg["source_id"] and old["source_id"] != leg["source_id"]
+                            or old["paid"] and not leg["paid"]):
+                    blocked.add(key)
+                group[part] = dict(leg, observed=report["to"], first_from=old["first_from"] if old else report["from"])
+        day_commissions = defaultdict(list)
+        for row in report.get("repo_commissions", []):
+            day_commissions[row["date"]].append(row)
+        for day, rows in day_commissions.items():
+            old = commissions.get(day)
+            if old is not None and len(old) != len(rows):
+                blocked_commissions.add(day)  # A partial day cannot replace a complete multiset.
+            if old is None:
+                for prior_day, prior_rows in commissions.items():
+                    if any(r["paid"] and not p["paid"] and Decimal(r["amount"]) == Decimal(p["amount"])
+                           for r in rows for p in prior_rows):
+                        blocked_commissions.update((day, prior_day))
+        bad_dates.update(blocked_commissions)
+        commissions.update(day_commissions)
+        pending = -sum((Decimal(row["amount"]) for day, rows in commissions.items() for row in rows
+                        if day not in blocked_commissions and (not row["paid"] or row["paid"] > report["to"])), Decimal(0))
+        values, unknown = {}, set(bad_dates)
+        for key, group in groups.items():
+            if key in blocked or set(group) != {1, 2}:
+                unknown.add(key[0])
+                continue
+            first, second = group[1], group[2]
+            if (first["qty"] != second["qty"] or first["side"] != -second["side"]
+                    or first["plan"] > second["plan"] or not first["paid"]
+                    or first["paid"] > report["to"] or first["paid"] < first["first_from"]
+                    or second["paid"] and second["paid"] < first["paid"]):
+                unknown.add(key[0])
+                continue
+            spread = first["side"] * Decimal(first["amount"]) + second["side"] * Decimal(second["amount"])
+            values[key] = {"cost": min(spread, Decimal(0)), "income": max(spread, Decimal(0)),
+                           "paid": bool(second["paid"] and second["paid"] <= report["to"]),
+                           "payment": second["paid"], "start": first["paid"]}
+        history.append((report["to"], values, unknown, pending))
+    return history
+
+
+def repo_interval(history, lo, hi):
+    """Accrual deltas, classified by end-of-period payment status (not cash twice)."""
+    start, end, unknown = {}, {}, set()
+    start_commission = end_commission = Decimal(0)
+    for day, values, issues, pending in history:
+        if day <= lo:
+            start = values
+            start_commission = pending
+        if day <= hi:
+            end = values
+            unknown = issues
+            end_commission = pending
+    out = dict.fromkeys(("repo_financing_paid", "repo_financing_preliminary", "repo_income_paid",
+                         "repo_income_preliminary", "repo_cash_cost_paid", "repo_cash_income_paid"), Decimal(0))
+    for key in start.keys() | end.keys():
+        old, new = start.get(key), end.get(key)
+        if new is None:
+            unknown.add(key[0])
+            continue
+        status = "paid" if new["paid"] else "preliminary"
+        out["repo_financing_" + status] += new["cost"] - (old["cost"] if old else Decimal(0))
+        out["repo_income_" + status] += new["income"] - (old["income"] if old else Decimal(0))
+        if new["paid"] and lo < new["payment"] <= hi:
+            out["repo_cash_cost_paid"] += new["cost"]
+            out["repo_cash_income_paid"] += new["income"]
+    out = {k: float(v) for k, v in out.items()}
+    out["repo_financing"] = round(out["repo_financing_paid"] + out["repo_financing_preliminary"], 2)
+    out["repo_income"] = round(out["repo_income_paid"] + out["repo_income_preliminary"], 2)
+    out["repo_commission_accrual_delta"] = float(end_commission - start_commission)
+    out["repo_commission_pending"] = float(end_commission)
+    out["cost_unknown"] = sum(d <= hi for d in unknown)
+    out.update({k + "_known": out[k] for k in ("repo_financing", "repo_income")})
+    if out["cost_unknown"]:
+        for key in ("repo_financing", "repo_income", "repo_financing_paid", "repo_financing_preliminary",
+                    "repo_income_paid", "repo_income_preliminary"):
+            out[key] = None
+    return out
 
 
 class Account:
@@ -357,16 +478,24 @@ class Account:
                 reps.append(c)
         reps.sort(key=lambda r: (r["from"], r["to"]))
         self.notes: list[str] = []
+        self.cost_source_issues = 0
         kept = []
         for r in reps:
             if kept and r["from"] <= kept[-1]["to"]:
                 j = join_overlap(kept[-1], r)
                 if j is None:
                     self.notes.append(f"справки пересекаются: {kept[-1]['file']} и {r['file']} — вторая не учтена")
+                    self.cost_source_issues += 1
                     continue
                 r = j
             kept.append(r)
         self.reports = kept
+        self.repo_history = repo_snapshots(kept)
+        self.cost_details = defaultdict(lambda: defaultdict(float))
+        for r in kept:
+            for d, kv in r.get("day_costs", {}).items():
+                for k, v in kv.items():
+                    self.cost_details[d][k] += v
         self.account_no = next((r["account"] for r in kept if r["account"]), acc)
         self.recon_bad = [(r["file"], {k: v for k, v in r["recon"].items() if abs(v[2]) > 0.01})
                           for r in kept if any(abs(v[2]) > 0.01 for v in r["recon"].values())]
@@ -407,6 +536,10 @@ class Account:
         self.first = kept[0]["from"] if kept else None
         self.last = kept[-1]["to"] if kept else None
         self._daily()
+        # Disclosure only: leave legacy daily result/equity and risk formulas unchanged.
+        for row in self.days:
+            row.update(self.expense_breakdown(bp.day_before(row["date"]), row["date"],
+                                             row["broker"], row["exch"], row["tax"]))
 
     # ── по дням ───────────────────────────────────────────────────────────────
     def _daily(self):
@@ -443,6 +576,36 @@ class Account:
                              "go": go_v, "go_pct": round(go_v / eq * 100, 1) if eq > 0 else None})
         self.days = rows
         self.go_bad = [g for g in self.go_check if abs(g[1]) > 1]
+
+    def expense_breakdown(self, lo, hi, broker, exch, tax):
+        out = repo_interval(getattr(self, "repo_history", []), lo, hi)
+        details = defaultdict(float)
+        for d, kv in getattr(self, "cost_details", {}).items():
+            if lo < d <= hi:
+                for k, v in kv.items():
+                    details[k] += v
+        depo = sum(kv.get(bp.KIND_DEPO, 0.0) for d, kv in self.kind.items() if lo < d <= hi)
+        adjustment = out["repo_commission_accrual_delta"]
+        out.update({"depo": depo, "broker_fees": broker - depo + adjustment, "other_costs": details["other_costs"],
+                    "repo_commission": details["repo_commission"] + adjustment})
+        out["repo_income_known"] += details["repo_income"]
+        if out["repo_income"] is not None:
+            out["repo_income"] += details["repo_income"]
+            out["repo_income_paid"] += details["repo_income"]
+        out["cost_unknown"] += int(details["unknown_costs_count"])
+        out["cost_unknown"] += sum(sum(r.get("unknown", {}).values()) for r in getattr(self, "reports", [])
+                                   if r["from"] <= hi and r["to"] > lo)
+        out["cost_unknown"] += sum(name.endswith(".xls") for name, _ in getattr(self, "bad_files", []))
+        out["cost_unknown"] += getattr(self, "cost_source_issues", 0)
+        out["cost_unknown"] += len(getattr(self, "recon_bad", [])) + len(getattr(self, "recon_na", []))
+        out["known_costs"] = round(broker + exch + tax + out["repo_financing_known"] + out["other_costs"] + adjustment, 2)
+        out["all_costs"] = None if out["cost_unknown"] else out["known_costs"]
+        out["cost_status"] = f"Нераспр.: {out['cost_unknown']}" if out["cost_unknown"] else "Полная"
+        out["cost_status_tip"] = (f"Нераспределённых источников / замечаний: {out['cost_unknown']}. "
+                                  "Неизвестные РЕПО, строки или несошедшиеся справки не приравнены к нулю; "
+                                  "полный итог и доля неизвестны. Подробности — в предупреждениях справок."
+                                  if out["cost_unknown"] else "Полная расшифровка по подтверждённым строкам справок")
+        return out
 
     # ── сводка за интервал ────────────────────────────────────────────────────
     def point_at(self, d: str):
@@ -524,6 +687,9 @@ class Account:
         exch, tax = s[bp.KIND_EXCH], s[bp.KIND_TAX]
         inc = s[bp.KIND_COUPON] + s[bp.KIND_INTEREST]
         rest = profit - vm - broker - exch - tax
+        expenses = self.expense_breakdown(pS[0], pE[0], broker, exch, tax)
+        rest -= (expenses["repo_financing_known"] + expenses["other_costs"] + expenses["repo_income_known"]
+                 + expenses["repo_commission_accrual_delta"])
         days = [r for r in self.days if pS[0] < r["date"] <= pE[0]]
         span = (dt.date.fromisoformat(pE[0]) - dt.date.fromisoformat(pS[0])).days
         # Доходность: каждый календарный год — только по своей стоимости на начало и конец
@@ -563,7 +729,7 @@ class Account:
         note = ""
         if pS[0] != bp.day_before(a) or pE[0] != b:
             note = f"по справкам: {ru(dt.date.fromisoformat(pS[0]) + dt.timedelta(days=1))}–{ru(pE[0])}"
-        return {
+        out = {
             "label": label, "from": pS[0], "to": pE[0], "note": note,
             "eq0": pS[1], "dep": dep, "wd": wd, "tr": trn, "eq1": pE[1],   # tr — справочно, уже в dep/wd
             "profit": profit, "pct": pct, "pct_y": pct_y,
@@ -574,6 +740,11 @@ class Account:
             "dd": -dd if dd else 0.0, "dd_pct": -dd_pct if dd_pct else None,
             "lots": lots, "deals": deals, "per_lot": -costs / lots if lots else None,
         }
+        out.update(expenses)
+        before_all = profit - expenses["all_costs"] if profit is not None and expenses["all_costs"] is not None else None
+        out["before_all"] = before_all
+        out["all_cost_share"] = -expenses["all_costs"] / before_all * 100 if before_all is not None and before_all > 0 else None
+        return out
 
     def years(self, a: str, b: str):
         out = []
@@ -771,8 +942,10 @@ Account.securities = _securities
 
 # ── результат по источникам (окно «Графики», блок «Инструменты») ──
 PART_SEC, PART_FX, PART_INT = "Ценные бумаги", "Валюта", "Проценты на остаток"
-PART_REQ, PART_TAX, PART_ETC = "ВМ к оплате", "Налоги", "Прочие расходы"
-PARTS_FIXED = (PART_SEC, PART_FX, PART_INT, PART_REQ, PART_TAX, PART_ETC)
+PART_REQ, PART_TAX, PART_ETC = "ВМ к оплате", "Налоги", "Прочий / нераспределённый результат"
+PART_FIN, PART_REPO_INC, PART_OTHER_COST = "Финансирование РЕПО", "Доходы / премии РЕПО", "Прочие подтверждённые расходы"
+PARTS_FIXED = (PART_SEC, PART_FX, PART_INT, PART_REQ, PART_TAX, PART_ETC,
+               PART_FIN, PART_REPO_INC, PART_OTHER_COST)
 
 
 def _parts_days(self) -> dict:
@@ -817,6 +990,14 @@ def _parts_days(self) -> dict:
         o[PART_TAX] += k.get(bp.KIND_TAX, 0.0)
         o[PART_ETC] += (k.get(bp.KIND_BROKER, 0.0) - self.broker_pfi.get(d, 0.0) - self.p_comm.get(d, 0.0)
                         + k.get(bp.KIND_DEPO, 0.0) - depo_pay.get(d, 0.0) + k.get(bp.KIND_OTHER, 0.0))
+        detail = getattr(self, "cost_details", {}).get(d, {})
+        o[PART_FIN] += r.get("repo_financing_known") or 0.0
+        o[PART_REPO_INC] += r.get("repo_income_known") or 0.0
+        o[PART_OTHER_COST] += r.get("other_costs") or 0.0
+        o[PART_ETC] += r.get("repo_commission_accrual_delta") or 0.0
+        o[PART_INT] -= detail.get("other_costs_interest", 0.0)
+        o[PART_ETC] -= (detail.get("other_costs", 0.0) - detail.get("other_costs_interest", 0.0)
+                        + detail.get("repo_income", 0.0))
         if r.get("exact") and d > last_pt:
             o[PART_REQ] += self.req.get(d, 0.0) - self.req.get(last_pt, 0.0)
             sec = self.securities(bp.day_after(last_pt), d)

@@ -265,13 +265,20 @@ def waterfall_values(acc, s: dict) -> tuple[list, float]:
     a, b = s["dates"][0], s["dates"][-1]
     profit = kpi_values(s)["profit"]
     sm = acc.summary(a, b, "w")
+    extras = ("depo", "repo_financing_known", "other_costs", "repo_income_known")
     if sm and sm["from"] == s["base"][0] and sm["to"] == b:
         vm, inc, br, ex, tax, profit = sm["vm"], sm["income"], sm["broker"], sm["exch"], sm["tax"], sm["profit"]
+        depo, financing, other_costs, repo_income = (sm.get(f) or 0.0 for f in extras)
+        br += sm.get("repo_commission_accrual_delta") or 0.0
     else:
         rows = [r for r in acc.days if a <= r["date"] <= b]
         vm, inc, br, ex, tax = (sum(r[f] for r in rows) for f in ("vm", "income", "broker", "exch", "tax"))
-    parts = [("ВМ", vm), ("доходы", inc), ("бумаги и пр.", profit - vm - inc - br - ex - tax),
-             ("брокер", br), ("биржа", ex), ("налоги", tax)]
+        depo, financing, other_costs, repo_income = (sum(r.get(f) or 0.0 for r in rows) for f in extras)
+        br += sum(r.get("repo_commission_accrual_delta") or 0.0 for r in rows)
+    parts = [("ВМ", vm), ("доходы", inc),
+             ("бумаги и пр.", profit - vm - inc - br - ex - tax - financing - other_costs - repo_income),
+             ("доходы РЕПО", repo_income), ("брокер", br - depo), ("депозитарий", depo),
+             ("биржа", ex), ("финансирование РЕПО", financing), ("прочие расходы", other_costs), ("налоги", tax)]
     return parts, profit
 
 
@@ -282,9 +289,12 @@ def fig_costs(acc, s: dict, theme: str = "graphite") -> go.Figure:
     parts, profit = waterfall_values(acc, s)
     fig = make_subplots(rows=1, cols=2, column_widths=[0.42, 0.58], horizontal_spacing=0.09,
                         specs=[[{}, {"secondary_y": True}]],
-                        subplot_titles=("Из чего прибыль за период, ₽", "Затраты по месяцам, ₽ (столбцы) и на лот, ₽ (линия)"))
+                        subplot_titles=("Из чего прибыль за период, ₽", "Подтверждённые затраты с налогами, ₽; комиссии на лот, ₽"))
     tips = {"ВМ": "вариационная маржа (оплаченная + начисленная на концах справок)", "доходы": "проценты на остаток, купоны, дивиденды",
-            "бумаги и пр.": "переоценка бумаг и валюты, прочее — остаток до прибыли", "брокер": "комиссия брокера и депозитарий",
+            "бумаги и пр.": "переоценка бумаг и валюты, нераспределённый результат — не только расходы", "брокер": "комиссия брокера без депозитария",
+            "депозитарий": "отдельно, без дубля в брокере", "доходы РЕПО": "положительная разница / доказанные премии клиенту, уже в прибыли",
+            "финансирование РЕПО": "начисления / signed ревизии, оплата не добавляется повторно",
+            "прочие расходы": "только подтверждённые проценты, заём, услуги",
             "биржа": "биржевой и клиринговый сбор", "налоги": "НДФЛ уплачено и удержано минус возвраты",
             "прибыль": "изменение стоимости без ввода и вывода"}
     fig.add_trace(go.Waterfall(
@@ -298,20 +308,27 @@ def fig_costs(acc, s: dict, theme: str = "graphite") -> go.Figure:
     g = {}
     for r in acc.days:
         if s["dates"][0] <= r["date"] <= s["dates"][-1]:
-            m = g.setdefault(r["date"][:7] + "-01", [0.0, 0.0, 0.0, 0.0])
-            m[0] -= r["broker"]
+            m = g.setdefault(r["date"][:7] + "-01", [0.0] * 9)
+            m[0] -= r["broker"] - (r.get("depo") or 0.0)
+            m[0] -= r.get("repo_commission_accrual_delta") or 0.0
             m[1] -= r["exch"]
             m[2] += r["lots"]
             m[3] += r["vm"]
+            m[4] -= r.get("depo") or 0.0
+            m[5] -= r.get("repo_financing_known") or 0.0
+            m[6] -= r.get("other_costs") or 0.0
+            m[7] -= r["tax"]
+            m[8] -= r["broker"]  # Legacy commissions per futures lot, not all expenses.
     ms = sorted(g)
-    for i, (nm, col) in enumerate((("брокер", c["acc"]), ("биржа", c["idx"]))):
+    for i, nm, col in ((0, "брокер", c["acc"]), (1, "биржа", c["idx"]), (4, "депозитарий", c["mut"]),
+                       (5, "финансирование РЕПО", c["bad"]), (6, "прочие расходы", c["txt"]), (7, "налоги", c["ok"])):
         fig.add_trace(go.Bar(x=ms, y=[g[m][i] for m in ms], name=nm, marker_color=col,
                              hovertemplate=nm + " %{y:,.0f} ₽<extra></extra>"), 1, 2)
-    per_lot = [(g[m][0] + g[m][1]) / g[m][2] if g[m][2] else None for m in ms]
-    share = [(g[m][0] + g[m][1]) / abs(g[m][3]) * 100 if g[m][3] else None for m in ms]
+    per_lot = [(g[m][8] + g[m][1]) / g[m][2] if g[m][2] else None for m in ms]
+    share = [(g[m][8] + g[m][1]) / abs(g[m][3]) * 100 if g[m][3] else None for m in ms]
     fig.add_trace(go.Scatter(x=ms, y=per_lot, name="на лот", mode="lines+markers", line=dict(color=c["txt"], width=1.4),
                              marker=dict(size=5), customdata=share, connectgaps=False,
-                             hovertemplate="на лот %{y:,.2f} ₽ · затраты / |ВМ| %{customdata:,.0f}%<extra></extra>"), 1, 2, secondary_y=True)
+                             hovertemplate="комиссии на лот %{y:,.2f} ₽ · комиссии / |ВМ| %{customdata:,.0f}%<extra></extra>"), 1, 2, secondary_y=True)
     fig.update_layout(barmode="stack", hovermode="closest")
     _layout(fig, c, 400, legend=True)
     fig.update_yaxes(tickformat=",.0f", row=1, col=1)
@@ -327,7 +344,8 @@ def fig_costs(acc, s: dict, theme: str = "graphite") -> go.Figure:
 OTHER_FUT = "прочие фьючерсы"
 TOTAL = "итого — прибыль счёта"
 PART_COLORS = {"Ценные бумаги": "#60a5fa", "Валюта": "#2dd4bf", "Проценты на остаток": "#e879f9",
-               "ВМ к оплате": "#a8a29e", "Налоги": "#f87171", "Прочие расходы": "#78716c"}
+               "ВМ к оплате": "#a8a29e", "Налоги": "#f87171", "Прочий / нераспределённый результат": "#78716c",
+               "Финансирование РЕПО": "#f59e0b", "Доходы / премии РЕПО": "#34d399", "Прочие подтверждённые расходы": "#fb923c"}
 
 
 def ins_series(acc, s: dict, top: int = 5) -> dict:
@@ -446,7 +464,7 @@ def kpi(s: dict) -> list:
 CHART_BLOCKS = (
     ("Доходность по месяцам, %", "индекс доходности: конец месяца к концу прошлого; «год» — произведение месяцев периода",
      "c-months"),
-    ("Затраты", "из чего сложилась прибыль периода; затраты брокера и биржи по месяцам и на один лот", "c-costs"),
+    ("Затраты", "из чего сложилась прибыль; подтверждённые затраты с налогами по месяцам; линия — только комиссии брокера и биржи на лот", "c-costs"),
     ("Инструменты", ("фьючерсы по базовому активу (комиссия брокера за день делится по лотам дня, как во "
                      "вкладке «По инструментам»), ценные бумаги, валюта, проценты на остаток, налоги; переоценка "
                      "бумаг и начисленная ВМ — на концах справок; сумма линий = прибыль"), "c-ins"))

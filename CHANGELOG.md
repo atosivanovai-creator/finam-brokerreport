@@ -2,6 +2,11 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.2.0] — 2026-11-22
+
+- Добавлена полная разбивка расходов и отдельный учёт доходов и премий РЕПО.
+- В отчёте и графиках видно оплаченное и предварительное финансирование РЕПО; неполные данные отмечаются отдельно.
+
 ## [1.1.1] — 2026-11-20
 
 - Добавлена поддержка операций РЕПО и их комиссий.
@@ -45,6 +50,7 @@
 
 - Первая версия.
 
+[1.2.0]: https://github.com/atosivanovai-creator/finam-brokerreport/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/atosivanovai-creator/finam-brokerreport/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/atosivanovai-creator/finam-brokerreport/compare/v1.0.6...v1.1.0
 [1.0.6]: https://github.com/atosivanovai-creator/finam-brokerreport/compare/v1.0.5...v1.0.6

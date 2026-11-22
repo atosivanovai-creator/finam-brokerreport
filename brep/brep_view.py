@@ -69,11 +69,26 @@ SUM_ROWS = [
     ("ДОХОД", "% годовых", "pct_y", "pct", True, "по стоимости на начало и конец в пересчёте на год (сложный процент); полный календарный год = «% за период»; от 30 дней данных"),
     ("ДОХОД", "в т.ч. срочный рынок (ВМ)", "vm", "rub", True,
      "вариационная маржа, включая начисленную и ещё не оплаченную на конец периода"),
-    ("ДОХОД", "в т.ч. бумаги, купоны и прочее", "rest", "rub", True, "остаток прибыли: купоны, проценты, переоценка бумаг"),
-    ("ЗАТРАТЫ", "Брокер", "broker", "rub", True, "комиссия брокера и депозитарий"),
+    ("ДОХОД", "в т.ч. бумаги, купоны и прочее", "rest", "rub", True, "нераспределённый результат после выделения подтверждённых затрат и дохода РЕПО; не категория расходов"),
+    ("ДОХОД", "Доходы / премии РЕПО", "repo_income", "rub", True, "положительная экономическая разница ног и явно связанные премии клиенту; уже внутри прибыли, не прибавляются повторно"),
+    ("ДОХОД", "↳ РЕПО: оплачено", "repo_income_paid", "rub", True, "доходные начисления периода с оплатой к его концу; не вознаграждение брокера"),
+    ("ДОХОД", "↳ РЕПО: предварительно", "repo_income_preliminary", "rub", True, "оценка доходных источников; при оплате не добавляется повторно"),
+    ("ЗАТРАТЫ", "Брокер", "broker_fees", "rub", True, "комиссия брокера без депозитария; подстрока РЕПО входит сюда, не складывать второй раз"),
+    ("ЗАТРАТЫ", "↳ в т.ч. комиссия РЕПО", "repo_commission", "rub", True, "справочная часть комиссии брокера, не дополнительный расход"),
+    ("ЗАТРАТЫ", "↳ комиссия РЕПО: оценка", "repo_commission_pending", "rub", True, "неоплаченные комиссии на конец периода; справочный остаток, НЕ дополнительный расход. При оплате оценка заменяется фактом"),
+    ("ЗАТРАТЫ", "Депозитарий", "depo", "rub", True, "отдельно от комиссии брокера, без повторного включения"),
     ("ЗАТРАТЫ", "Биржа", "exch", "rub", True, "биржевой сбор"),
+    ("ЗАТРАТЫ", "Финансирование РЕПО", "repo_financing", "rub", True, "стоимость переноса: отрицательная экономическая разница ног, начисляется на первой точной границе с подтверждением пары и оплаченной первой ногой; не principal и не второй вычет из прибыли"),
+    ("ЗАТРАТЫ", "↳ РЕПО: оплачено", "repo_financing_paid", "rub", True, "начисления выбранного периода, оплаченные к его концу. Оплата начисления прошлого периода — только в справочной строке ниже"),
+    ("ЗАТРАТЫ", "↳ РЕПО: предварительно", "repo_financing_preliminary", "rub", True, "начисления периода с неоплаченной второй ногой; позже заменяются фактом, не складываются с ним"),
+    ("ЗАТРАТЫ", "↳ оплачено РЕПО, справочно", "repo_cash_cost_paid", "rub", True, "экономическая разница пар, оплаченных в периоде, в том числе начисленных раньше; НЕ дополнительная категория в итоге"),
+    ("ЗАТРАТЫ", "Прочие подтверждённые", "other_costs", "rub", True, "расходы: отдельные проценты, заём, услуги по первичке; возвраты расходов со знаком плюс; не весь остаток результата"),
     ("ЗАТРАТЫ", "Налоги", "tax", "rub", True, "НДФЛ: уплачено и удержано, минус возвраты"),
-    ("ЗАТРАТЫ", "Затраты от прибыли до затрат", "cost_share", "pct", False, "(брокер + биржа) / прибыль до затрат и налогов"),
+    ("ЗАТРАТЫ", "Подтверждённые затраты", "known_costs", "rub", True, "затраты: сумма непересекающихся категорий: брокер + депозитарий + биржа + финансирование + прочие расходы + налоги; без подстрок и доходов РЕПО"),
+    ("ЗАТРАТЫ", "Все затраты, с налогами", "all_costs", "rub", True, "тот же итог; неизвестно при неполной расшифровке"),
+    ("ЗАТРАТЫ", "Прибыль до всех затрат", "before_all", "rub", True, "чистая прибыль минус signed итог затрат; net = до + затраты, без повторного вычета"),
+    ("ЗАТРАТЫ", "Затраты от прибыли до затрат", "all_cost_share", "pct", False, "−все затраты / прибыль до именно этих затрат, включая налоги; только при положительном знаменателе и известном составе"),
+    ("ЗАТРАТЫ", "Полнота расшифровки", "cost_status", "text", False, "неизвестное не приравнивается к нулю; балансирующий остаток не объявляется расходом"),
     ("РИСК", "ГО макс", "go_max", "rub", False, "наибольшее ГО на конец дня"),
     ("РИСК", "ГО / стоимость счёта макс", "go_pct_max", "pct", False, "наибольшая доля ГО от стоимости счёта на конец дня"),
     ("РИСК", "Худший день", "worst", "rub", True, "результат дня = ВМ − комиссии + доходы"),
@@ -89,13 +104,15 @@ SUM_ROWS = [
 
 def summary_table(cols_data):
     cols = [{"field": "name", "headerName": "Показатель", "pinned": "left", "width": 212, "tooltipField": "tip",
+             "valueFormatter": {"function": "params.data.display_name || params.value"},
              "cellClassRules": {"sec": "params.data.sec === true"}}]
     for k, (lab, _) in enumerate(cols_data):
-        # колонки лет делят ширину экрана поровну; не уже 96 px (число до 11 знаков) — дальше горизонтальная прокрутка
+        # колонки лет делят ширину экрана; минимум 107 px — 11 знаков со знаком и разделителями в жирном «Итого»
         # colId по подписи (год / «Итого»), а не по номеру: ширина, заданная человеком, держится за свой год
         # при смене периода (assets/brep-cols.js)
         cols.append({"field": f"c{k}", "colId": f"y-{lab}", "headerName": lab, "type": "rightAligned", "flex": 1,
-                     "minWidth": 96,
+                     "minWidth": 107,
+                     "tooltipValueGetter": {"function": "(params.data[params.colDef.field + '_tip'] || (params.value == null ? 'неизвестно' : String(params.value))) + ' · ' + (params.data.tip || '')"},
                      "valueFormatter": {"function": "fmtv(params)"},
                      "cellClassRules": {"neg": "params.data.sign && params.value < 0",
                                         "pos": "params.data.sign && params.value > 0",
@@ -106,11 +123,17 @@ def summary_table(cols_data):
             rows.append({"name": section, "sec": True})
             sec = section
         r = {"name": name, "fmt": fmt, "sign": sign, "tip": tip}
+        if field == "all_cost_share":
+            r["display_name"] = "Доля всех затрат, %"  # Preserve the legacy row key for existing consumers.
         for k, (_, d) in enumerate(cols_data):
             r[f"c{k}"] = d.get(field)
+            if field == "cost_status":
+                r[f"c{k}_tip"] = d.get("cost_status_tip", "")
         rows.append(r)
     return cols, rows
 
+
+DAY_COST_FIELDS = ("all_costs", "repo_financing", "repo_income", "depo", "other_costs")
 
 DAY_COLS = [
     {"field": "date", "headerName": "Дата", "pinned": "left", "width": 118, "minWidth": 118, "sort": "desc",
@@ -121,6 +144,11 @@ DAY_COLS = [
     money("result", "Результат", sign=True, w=104, tip="ВМ − комиссии + доходы (без налогов, ввода/вывода)"),
     money("vm", "ВМ", sign=True, w=100), money("broker", "Брокер", sign=True, w=92), money("exch", "Биржа", sign=True, w=96),
     money("income", "Доходы", sign=True, w=88), money("tax", "Налоги", sign=True, w=88),
+    money("depo", "в т.ч. депозитарий", sign=True, w=108, tip="справочно: уже в колонке Брокер"),
+    money("repo_financing", "Финансирование РЕПО", sign=True, w=118, tip="начисление / signed ревизия; не повторная оплата и не principal"),
+    money("repo_income", "Доход / премии РЕПО", sign=True, w=118),
+    money("other_costs", "Прочие расходы", sign=True, w=110),
+    money("all_costs", "Все затраты с налогами", sign=True, w=124, tip="без повторов подстрок; неизвестно при неполноте данных"),
     money("flow", "Ввод/вывод", sign=True, w=100), money("lots", "Лоты", w=86), money("deals", "Сделки", w=78),
     money("go", "ГО", w=108, tip="на конец дня (неделя/месяц — максимум)"),
     dict(pct("go_pct", "ГО / счёт", tip="на конец дня (неделя/месяц — максимум)"), minWidth=78),
@@ -195,6 +223,7 @@ def days_rows(acc, a: str, b: str, mode: str):
     out = []
     if mode == "day":
         for r in rows:
+            r = dict(r, **{f: r.get(f) for f in DAY_COST_FIELDS})
             out.append(dict(r, flow=round(r["dep"] + r["wd"] + r["tr"], 2),
                             eq_tip="точно, по справке" if r["exact"] else "оценка: последняя справка + деньги дня"))
     else:
@@ -212,9 +241,13 @@ def days_rows(acc, a: str, b: str, mode: str):
                         "income": s("income"), "tax": s("tax"), "flow": round(s("dep") + s("wd") + s("tr"), 2),
                         "lots": s("lots"), "deals": s("deals"), "go": max(x["go"] for x in rs),
                         "go_pct": max(gp) if gp else None})
+            out[-1].update({f: (None if any(r.get(f) is None for r in rs)
+                               else round(sum(r[f] for r in rs), 2)) for f in DAY_COST_FIELDS})
     tot = {"date": None, "lab": "Итого"}
     for f in ("result", "vm", "broker", "exch", "income", "tax", "flow", "lots", "deals"):
         tot[f] = round(sum(r[f] for r in out), 2)
+    for f in DAY_COST_FIELDS:
+        tot[f] = None if any(r.get(f) is None for r in out) else round(sum(r[f] for r in out), 2)
     return out, [tot]
 
 

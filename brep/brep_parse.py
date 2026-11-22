@@ -14,8 +14,56 @@ import datetime as dt
 import math
 import re
 import threading
+from decimal import Decimal
 
 from .htables import tables
+
+REPO_OPS = {
+    "Покупка (РЕПО ч.1)": (1, -1), "Продажа (РЕПО ч.2)": (2, 1),
+    "Продажа (РЕПО ч.1)": (1, 1), "Покупка (РЕПО ч.2)": (2, -1),
+}
+
+
+def expense_category(kind, typ, comment, amount):
+    """Only source-confirmed expenses/income; no balancing-residual inference."""
+    text = (typ + " " + comment).lower()
+    linked_repo = bool(re.search(r"р[еэ]по", text))
+    refund = bool(re.search(r"возврат|коррекц|возмещ", text))
+    if (linked_repo and amount > 0 and not refund
+            and re.search(r"преми|доход|вознагражден|процент", text)
+            and kind not in (KIND_BROKER, KIND_EXCH, KIND_DEPO, KIND_TAX)):
+        return "repo_income"
+    if kind in (KIND_OTHER, KIND_INTEREST):
+        expense = re.search(r"процент|за[её]м|займ|услуг|плат[аы] за|комисси", text)
+        confirmed_refund = refund and re.search(r"комисси|услуг|расход|ранее списан", text)
+        if expense and (amount < 0 or confirmed_refund):
+            return "other_costs"
+        if amount < 0:
+            return "unknown_costs"
+    return ""
+
+
+def repo_leg(row):
+    """Strict source facts, including planned legs, independent of holdings."""
+    part, side = REPO_OPS[row[4]]
+    if len(row) != 27 or row[11] != "Рубль":
+        raise ValueError("форма/валюта РЕПО")
+    day, plan, paid = iso(row[0]), iso(row[18]), iso(row[20])
+    if not day or not plan or row[20] and not paid:
+        raise ValueError("даты РЕПО")
+    for date in (day, plan, paid):
+        if date:
+            dt.date.fromisoformat(date)
+    dt.time.fromisoformat(row[1])
+    qty, amount = (Decimal(value.replace("\u00a0", "").replace(" ", "").replace(",", ".").replace("\u2212", "-"))
+                   for value in (row[5], row[13]))
+    if not qty.is_finite() or not amount.is_finite():
+        raise ValueError("не конечная сумма РЕПО")
+    if not ISIN.fullmatch(row[3]) or qty <= 0 or qty != int(qty) or amount <= 0:
+        raise ValueError("ISIN/количество/сумма РЕПО")
+    return {"date": day, "time": row[1], "isin": row[3], "qty": str(qty),
+            "part": part, "side": side, "amount": str(amount), "plan": plan, "paid": paid,
+            "source_id": row[24]}
 
 DATE = re.compile(r"^(\d\d)\.(\d\d)\.(\d{4})$")
 ISO = re.compile(r"^\d{4}-\d\d-\d\d$")
@@ -113,7 +161,8 @@ def _parse_report(text: str, name: str = "") -> dict:
     if not m:
         raise ValueError("не справка: нет периода")
     r = {"file": name, "from": iso(m.group(1)), "to": iso(m.group(2)), "account": "",
-         "items": [], "trades": {}, "go_changes": [], "unknown": {}}
+         "items": [], "trades": {}, "go_changes": [], "unknown": {}, "repo_legs": [], "repo_unknown": [],
+         "repo_commissions": []}
     for row in tabs[0][1]:
         if row and row[0].startswith("По счету"):
             r["account"] = row[1]
@@ -152,10 +201,12 @@ def _parse_report(text: str, name: str = "") -> dict:
     r["recon_na"] = "итоги «Виды движений» не распознаны" if ftab and not f else ""
     items = r["items"]
 
-    def add(date, kind, amount, instr="", comment="", src=""):
+    def add(date, kind, amount, instr="", comment="", src="", category=""):
         if date and abs(amount) > 1e-9:
             items.append({"date": date, "kind": kind, "instr": instr, "amount": round(amount, 2),
                           "comment": comment, "src": src})
+            if category:
+                items[-1]["category"] = category
 
     # Неторговые операции с деньгами
     for row in _find(tabs, "Неторговые операции с денежными"):
@@ -167,13 +218,16 @@ def _parse_report(text: str, name: str = "") -> dict:
         amount = num(row[4]) - num(row[5])
         comment = row[-1]
         kind = _nontrade_kind(row[1], comment, amount)
+        category = expense_category(kind, row[1], comment, amount)
+        if category == "repo_income":
+            kind = KIND_OTHER  # Confirmed client reward, not an external deposit.
         wt = re.search(r"удержан налог\s*([\d\s.,]+)", comment, re.I)
         if kind in (KIND_COUPON, KIND_INTEREST) and wt and num(wt.group(1)):
             add(iso(row[0]), kind, amount + num(wt.group(1)), row[2], comment, "неторговые")
             add(iso(row[0]), KIND_TAX, -num(wt.group(1)), row[2], TAX_INTEREST if kind == KIND_INTEREST else TAX_WITHHELD,
                 "неторговые")
             continue
-        add(iso(row[0]), kind, amount, row[2], comment or row[1], "неторговые")
+        add(iso(row[0]), kind, amount, row[2], comment or row[1], "неторговые", category)
     # Торговые движения ПФИ
     vm_agg, ex_agg = {}, {}
     for row in _find(tabs, "Торговые движения ПФИ"):
@@ -258,7 +312,12 @@ def _parse_report(text: str, name: str = "") -> dict:
         if op in ("Выдача займа ЦБ", "Возврат выданного займа ЦБ"):
             r["papers"]["lend"] += 1
             continue
-        if op not in ("Покупка (РЕПО ч.1)", "Продажа (РЕПО ч.2)", "Комиссия брокерская"):
+        if op in REPO_OPS:
+            try:
+                r["repo_legs"].append(repo_leg(row))
+            except (ValueError, ArithmeticError):
+                r["repo_unknown"].append(iso(row[0]))
+        if op not in (*REPO_OPS, "Комиссия брокерская"):
             why = op
         elif len(row) != 27:
             why = f"{len(row)} ячеек"
@@ -276,16 +335,27 @@ def _parse_report(text: str, name: str = "") -> dict:
             paid = iso(row[20])                 # не подменяем фактическую оплату планом или датой сделки
             if op == "Комиссия брокерская":
                 add(paid, KIND_BROKER, -amount, "", row[26], "Регламент")
+                try:
+                    fee = Decimal(row[14].replace("\u00a0", "").replace(" ", "").replace(",", ".").replace("\u2212", "-"))
+                    if not fee.is_finite():
+                        raise ValueError("не конечная комиссия РЕПО")
+                except (ValueError, ArithmeticError):
+                    r["repo_unknown"].append(iso(row[0]))
+                else:
+                    r["repo_commissions"].append({"date": iso(row[0]), "paid": paid, "amount": str(fee)})
             else:
-                buy = op == "Покупка (РЕПО ч.1)"
+                buy = REPO_OPS[op][1] == -1
                 add(paid, KIND_REPO_BUY if buy else KIND_REPO_SELL, (-1 if buy else 1) * amount,
                     row[3] or row[2], op, "Регламент")
                 if num(row[14]):                # образец содержит отдельную комиссию, встроенную не угадываем
                     k = "сделки по Регламенту: комиссия в строке РЕПО"
                     r["unknown"][k] = r["unknown"].get(k, 0) + 1
+                    r["repo_unknown"].append(iso(row[0]))
             continue
         k = "сделки по Регламенту: " + why
         r["unknown"][k] = r["unknown"].get(k, 0) + 1
+        if op in REPO_OPS or "РЕПО" in op or op == "Комиссия брокерская":
+            r["repo_unknown"].append(iso(row[0]))
     return r
 
 
